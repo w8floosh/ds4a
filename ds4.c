@@ -4973,7 +4973,24 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
     return 0;
 #else
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+    uint64_t recommended = ds4_gpu_recommended_working_set_size();
+    /*
+     * The explicit expert-cache budget is host RAM on discrete CUDA
+     * (the routed experts stream from the page cache; the GPU's VRAM is
+     * consumed by the resident non-routed weights and is already
+     * accounted separately). ds4_gpu_recommended_working_set_size reports
+     * VRAM there, which would cap a 40 GiB cache to a few GiB on a 12 GiB
+     * card. Use the physical host memory for the host-side cap instead.
+     */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (backend == DS4_BACKEND_CUDA) {
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long page_sz = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && page_sz > 0) {
+            recommended = (uint64_t)pages * (uint64_t)page_sz;
+        }
+    }
+#endif
     if (recommended == 0) return 0;
 
     /*
@@ -21477,8 +21494,20 @@ static bool metal_graph_use_q4_selected_shared_overlap(
 
 static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    /*
+     * On discrete NVIDIA GPUs the per-layer GPU work is a few hundred
+     * microseconds while a streaming expert load takes milliseconds, so
+     * the shared-expert overlap window cannot hide the load and the
+     * overlap path's extra device syncs and worker round-trips cost more
+     * than they save. The direct selected-load path (commit the layer,
+     * read the ids, upload, commit) overlaps the GPU kernels of the
+     * current layer with the host-side load naturally. Machines with a
+     * heavier per-layer GPU profile can opt in with
+     * DS4_CUDA_ENABLE_STREAMING_SELECTED_SHARED_OVERLAP.
+     */
     return g &&
            g->ssd_streaming &&
+           getenv("DS4_CUDA_ENABLE_STREAMING_SELECTED_SHARED_OVERLAP") != NULL &&
            getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
 #else
     (void)g;
