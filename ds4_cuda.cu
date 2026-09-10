@@ -630,6 +630,11 @@ static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
+
+/* Forward declarations: model-range OOM recovery evicts the pure-speed
+ * Q8->F16/F32 derived caches (defined below in this file). */
+static void cuda_q8_f32_cache_release_all(void);
+static uint64_t cuda_model_derived_cache_oom_evict(void);
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -989,6 +994,14 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     err = cudaMalloc(&dev, (size_t)bytes);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
+        /* Fragmented/full device: free the pure-speed derived caches once and
+         * retry before reporting failure. */
+        if (cuda_model_derived_cache_oom_evict() != 0) {
+            err = cudaMalloc(&dev, (size_t)bytes);
+            if (err != cudaSuccess) (void)cudaGetLastError();
+        }
+    }
+    if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
         return NULL;
@@ -1554,6 +1567,82 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
+}
+
+static void cuda_q8_f32_cache_release_all(void) {
+    for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
+        (void)cudaFree(r.device_ptr);
+    }
+    g_q8_f32_ranges.clear();
+    g_q8_f32_by_offset.clear();
+    g_q8_f32_bytes = 0;
+}
+
+/* VRAM emergency for the model weight cache: a needed model tensor could not
+ * be cached because the device is full. The Q8->F16/F32 dequant copies are
+ * pure-speed derived buffers that can be dropped and rebuilt lazily, so free
+ * them and retry. A device sync plus decode-graph invalidation guarantees no
+ * queued kernel still references a freed buffer. Single-GPU only: the
+ * multi-GPU path keeps weights in per-device selective caches, not here. */
+static uint64_t cuda_model_derived_cache_oom_evict(void) {
+    if (g_n_gpus > 1) return 0;
+    const uint64_t f16 = g_q8_f16_bytes;
+    const uint64_t f32 = g_q8_f32_bytes;
+    if (f16 == 0 && f32 == 0) return 0;
+    (void)cudaDeviceSynchronize();
+    (void)cudaGetLastError();
+    ds4_gpu_decode_graphs_invalidate();
+    cuda_q8_f16_cache_release_all();
+    cuda_q8_f32_cache_release_all();
+    g_q8_f16_disabled_after_oom = 0;
+    g_q8_f16_budget_notice_printed = 0;
+    g_model_cache_full = 0;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA evicted %.2f MiB of derived weight caches on model-range OOM\n",
+                (double)(f16 + f32) / 1048576.0);
+    }
+    return f16 + f32;
+}
+
+/*
+ * Emergency VRAM relief for the vendored mmq scratch pool (cudaMallocAsync).
+ *
+ * The pool grows lazily and competes with the model arena's plain cudaMalloc
+ * for the same physical VRAM. On a small discrete card the arena can claim
+ * everything the non-routed weights need, so the first large prefill after
+ * the arena has filled up fails inside cudaMallocAsync and the vendored
+ * CUDA_CHECK aborts the whole process (the "second prompt after a long
+ * output" crash).
+ *
+ * The per-layer resident expert pools and the derived q8->f16/f32 caches are
+ * pure speed caches: correctness never depends on them. Drop them on demand
+ * and keep the resident pool disabled so the next decode does not immediately
+ * re-starve the scratch pool. Returns the number of bytes released, so the
+ * caller can retry the allocation only when the relief actually freed memory.
+ */
+extern "C" uint64_t ds4_cuda_pool_oom_relief(void) {
+    /* Freeing/synchronizing inside a graph capture would invalidate it; the
+     * capture caller already retires the entry and re-encodes eagerly. */
+    if (g_decode_graph_capturing) return 0;
+    uint64_t freed = 0;
+    for (uint32_t i = 0; i < DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS; i++) {
+        cuda_layer_resident_experts *r = &g_layer_resident[i];
+        if (!r->valid) continue;
+        freed += r->gate_capacity + r->up_capacity + r->down_capacity;
+        cuda_layer_resident_release_one(r);
+    }
+    if (freed != 0) {
+        g_stream_resident_slots_cap = 0;
+        if (getenv("DS4_CUDA_STREAM_RESIDENT") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA released %.2f MiB of resident expert pools "
+                    "to satisfy scratch allocation; resident pool disabled\n",
+                    (double)freed / 1048576.0);
+        }
+    }
+    freed += cuda_model_derived_cache_oom_evict();
+    return freed;
 }
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {
@@ -2440,7 +2529,9 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
-    if (g_model_cache_full) return NULL;
+    if (g_model_cache_full && cuda_model_derived_cache_oom_evict() == 0) {
+        return NULL;
+    }
     const uint64_t align = 256u;
     const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
 
@@ -2488,7 +2579,15 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
                 what ? what : "weights",
                 (double)chunk / 1048576.0,
                 cudaGetErrorString(err));
+        (void)cudaGetLastError();
         g_model_cache_full = 1;
+        /* Out of VRAM: drop the pure-speed derived caches once and retry
+         * before giving up. The recursive call is bounded: the eviction
+         * above releases memory only on its first invocation, so the second
+         * level fails fast instead of recursing again. */
+        if (cuda_model_derived_cache_oom_evict() != 0) {
+            return cuda_model_arena_alloc(bytes, what);
+        }
         return NULL;
     }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
@@ -2517,14 +2616,17 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return cuda_model_ptr(model_map, offset);
+        /* No host-pointer fallback here: reaching this point means the model
+         * is neither device-copied nor host-registered nor HMM-mapped (those
+         * short-circuit in cuda_model_range_ptr), so handing a raw host
+         * address to a kernel is an illegal memory access on a discrete GPU.
+         * Return NULL so the caller falls through to the direct cudaMalloc
+         * path, which fails cleanly if the device is genuinely full. */
+        return NULL;
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
-    if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_ptr(model_map, offset);
-    }
+    if (!dev) return NULL;
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();

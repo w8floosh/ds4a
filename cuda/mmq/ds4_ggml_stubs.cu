@@ -138,6 +138,12 @@ extern "C" cudaStream_t ds4_pool_get_stream(void) {
     return t_ds4_pool_stream;
 }
 
+/* Defined in ds4_cuda.cu. Releases ds4's pure-speed VRAM caches (resident
+ * expert pools, derived q8->f16/f32 caches) and returns the bytes freed.
+ * The mmq scratch pool calls this when cudaMallocAsync fails, so a
+ * prefill that outgrows the free VRAM recovers instead of aborting. */
+extern "C" uint64_t ds4_cuda_pool_oom_relief(void);
+
 namespace {
 
 struct ds4_naive_pool : public ggml_cuda_pool {
@@ -193,7 +199,12 @@ struct ds4_naive_pool : public ggml_cuda_pool {
         return ptr;
 #else
         void * ptr = nullptr;
-        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
+        cudaError_t err = cudaMallocAsync(&ptr, size, t_ds4_pool_stream);
+        if (err != cudaSuccess && ds4_cuda_pool_oom_relief() != 0) {
+            (void)cudaGetLastError();
+            err = cudaMallocAsync(&ptr, size, t_ds4_pool_stream);
+        }
+        CUDA_CHECK(err);
         if (actual_size) *actual_size = size;
         return ptr;
 #endif
