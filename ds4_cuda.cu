@@ -10386,6 +10386,7 @@ attention_indexed_mixed_heads8_online_kernel(
     __shared__ uint32_t raw_rows[256];
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
+    __shared__ uint8_t stage_comp_invalid[ROWS_PER_STAGE];
     __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
 
     uint32_t qpos = pos0 + t;
@@ -10449,9 +10450,18 @@ attention_indexed_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const uint32_t comp_idx = sr < raw_count
+            const uint32_t comp_raw = sr < raw_count
                 ? 0u
                 : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
+            /* Masked selected rows arrive as negative ids (V4.1 pads with -1)
+             * or as ids beyond the row's causal visible count. Keep them out
+             * of the gather and drop their contribution; valid ids and the
+             * existing V4 Flash ids are always < visible_comp. */
+            const bool comp_invalid =
+                sr >= raw_count && comp_raw >= visible_comp;
+            if (sr >= raw_count && c4 == 0u)
+                stage_comp_invalid[rr] = comp_invalid ? 1u : 0u;
+            const uint32_t comp_idx = comp_invalid ? 0u : comp_raw;
             const float4 *src = sr < raw_count
                 ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
                 : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
@@ -10460,6 +10470,8 @@ attention_indexed_mixed_heads8_online_kernel(
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0; rr < nr; rr++) {
+                if (row0 + rr >= raw_count && stage_comp_invalid[rr])
+                    continue;
                 const float4 *kv4 = kv_shared + rr * 128u;
                 float4 k0 = kv4[lane +  0u];
                 float4 k1 = kv4[lane + 32u];
@@ -33848,3 +33860,7 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
+
+/* DeepSeek V4.1 primitives. Kept in a separate include so the rest of the
+ * CUDA backend (and the discrete-GPU streaming tuning) stays untouched. */
+#include "ds4_cuda_dsv41.inc"

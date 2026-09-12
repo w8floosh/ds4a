@@ -39072,9 +39072,9 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     return true;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 /* =========================================================================
- * DeepSeek V4.1 Metal Graph.
+ * DeepSeek V4.1 GPU Graph (Metal and CUDA).
  * =========================================================================
  * Four layers own compressed KV/index keys. Every layer owns its sliding
  * window; index-source layers publish selections for following reuse layers.
@@ -56681,7 +56681,7 @@ struct ds4_session {
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
 #ifndef DS4_NO_GPU
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
     ds41_gpu_graph ds41_graph;
     bool ds41_graph_ready;
 #endif
@@ -60130,7 +60130,7 @@ int ds4_dump_chat_tokenization(const char *model_path,
 }
 
 #ifndef DS4_NO_GPU
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
 static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
 #endif
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
@@ -65485,7 +65485,7 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
            opt->distributed.role == DS4_DISTRIBUTED_NONE;
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                                       bool fit_cache, uint64_t host,
                                       uint64_t recommended) {
@@ -65849,7 +65849,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
 #endif
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
@@ -66272,7 +66272,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-#if defined(__APPLE__)
+#if !defined(DS4_ROCM_BUILD)
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
@@ -67658,7 +67658,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
@@ -68024,7 +68024,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
@@ -69715,7 +69715,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
     if (ds4_session_is_ds41(s)) {
         ds41_gpu_graph *g = &s->ds41_graph;
         if (!s->ds41_graph_ready) {
@@ -71634,7 +71634,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
     if (ds4_session_is_ds41(s)) {
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
@@ -78361,7 +78361,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
-#ifdef __APPLE__
+#if !defined(DS4_ROCM_BUILD)
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
     ds4_session_glm_reset_dense_cache(s);

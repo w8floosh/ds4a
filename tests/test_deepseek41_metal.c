@@ -44,7 +44,14 @@ static float nearest(float value, int fp4) {
 }
 
 static ds4_gpu_tensor *upload(const void *data, size_t bytes) {
+    /* This test inspects tensor contents from the host. Metal buffers are
+     * shared, but CUDA needs managed memory for that; on Metal the managed
+     * allocator is identical to the plain one. */
+#ifdef __APPLE__
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
+#else
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_managed(bytes);
+#endif
     if (t && data && !ds4_gpu_tensor_write(t, 0, data, bytes)) {
         ds4_gpu_tensor_free(t);
         return NULL;
@@ -500,6 +507,9 @@ static int check_attention_output(void) {
         0, a_bytes, xt, ROWS));
     CHECK(!ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, xt, ROWS + 1));
+#ifdef __APPLE__
+    /* V4.1 tensor parallelism (rank-sharded attention output) is implemented
+     * on Metal only; the CUDA session keeps tp_world = 1. */
     ds4_gpu_tensor *packed = upload(NULL, xb / 2);
     ds4_gpu_tensor *partial[2] = {upload(NULL, ob), upload(NULL, ob)};
     CHECK(packed && partial[0] && partial[1]);
@@ -554,6 +564,7 @@ static int check_attention_output(void) {
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, packed, ROWS + 1, 0));
     ds4_gpu_tensor_free(partial[0]); ds4_gpu_tensor_free(partial[1]); ds4_gpu_tensor_free(packed);
+#endif
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     ds4_gpu_cleanup();
     free(x); free(reference); free(reference_low); free(model);

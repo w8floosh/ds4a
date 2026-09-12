@@ -2,12 +2,111 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+# ds4a — an Ampere-optimized DwarfStar fork
+
+`ds4a` is a fork of [`antirez/ds4`](https://github.com/antirez/ds4) whose goal
+is to make the CUDA backend excellent on **NVIDIA Ampere** GPUs (compute
+capability 8.0/8.6: RTX 30-series, A100, and similar), especially small-VRAM
+cards that must run models far larger than their memory by streaming routed
+experts from an NVMe SSD. It tracks upstream closely and keeps the Metal
+backend, the CPU reference, and the distributed paths intact; all work here is
+CUDA-focused.
+
+The primary target is a single 12 GB Ampere card (for example an RTX 3080 Ti)
+running the ~81 GiB DeepSeek V4 Flash model, and DeepSeek V4.1 Flash, from a
+fast local SSD.
+
+Build for a local Ampere card with:
+
+```sh
+make cuda-generic            # detects the local architecture (sm_86 on RTX 30)
+make ds4 CUDA_ARCH=sm_86     # or request Ampere explicitly
+```
+
+## What this fork changes over antirez/ds4
+
+### CUDA SSD streaming tuned for discrete 12 GB GPUs
+
+The upstream CUDA streaming path was written for the large unified-memory DGX
+Spark. On a 12 GB discrete card the bottleneck is VRAM, PCIe, and random NVMe
+reads, so this fork adds:
+
+* **Per-layer resident expert pools.** Sticky routing reuses recently selected
+  experts with device-to-device copies instead of host reads plus PCIe uploads.
+  Opt in with `DS4_CUDA_STREAM_RESIDENT=N` (N slots per layer).
+* **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
+  the single-threaded chunk loop and saturating host read bandwidth.
+* **Host-side expert page-cache budget.** Hot experts stay in the OS page cache
+  (system RAM) instead of being re-read from the SSD; `O_DIRECT` is skipped when
+  the budget is set.
+* **Deeper read/upload overlap.** The streaming staging pool was doubled to 8
+  buffers.
+* **Arena fills to the last free MiB.** When the model arena runs out of VRAM
+  it retries smaller `cudaMalloc` chunks instead of failing one over-large
+  allocation and downgrading the whole run to PCIe reads.
+* **MMQ routed-MoE prefill from the compacted selected-expert table**, so batch
+  prefill runs on GPUs whose VRAM cannot hold the full expert set.
+* **Dense token-tile HMMA attention gated behind an env flag**, because its
+  stage ring faults on discrete GPUs below a full prefill chunk.
+* **Host-RAM-based manual expert-cache sizing** and disabled shared-expert
+  streaming overlap on discrete NVIDIA GPUs.
+
+### CUDA crash recovery instead of aborting on VRAM exhaustion
+
+On small discrete GPUs the streaming model arena (plain `cudaMalloc`) and the
+vendored MMQ scratch pool (`cudaMallocAsync`) compete for the same physical
+VRAM. Once the arena cached the non-routed weights, a large prefill could fail
+inside the pool's `cudaMallocAsync`, and the vendored `CUDA_CHECK` aborted the
+process (the "crash on the second prompt after a long output" report).
+
+This fork adds `ds4_cuda_pool_oom_relief()`: when the scratch pool cannot
+allocate, it drops the resident expert pools and the Q8-to-F16/F32 derived
+caches (pure speed caches; correctness never depends on them), keeps the
+resident pool disabled so the next decode does not immediately re-starve the
+pool, and retries once. The model arena's own OOM path now evicts the derived
+caches and retries before falling back, and the from-fd range resolver no
+longer hands a raw host address to a kernel on a full device.
+
+Verified with a 6-turn server conversation on a 12 GiB RTX 3080 Ti using
+`DS4_CUDA_STREAM_RESIDENT=3`, which previously aborted on the second prompt.
+
+### DeepSeek V4.1 Flash on CUDA
+
+Upstream shipped V4.1 Flash for Metal only. This fork ports the V4.1 primitives
+to CUDA (`ds4_cuda_dsv41.inc`) and enables the shared V4.1 graph for the CUDA
+backend, so V4.1 text inference can run on Ampere cards with SSD streaming:
+
+* Activation/cache formats: BF16 rounding, FP8 E8M0, FP4 E8M0, and FP4 E4M3.
+* Unit-magnitude RoPE (normal and compressed frequencies) and compressed-pair
+  striding.
+* Engram residual gating; Engram tables stay on disk as upstream requires.
+* Compressed KV pair pooling, causal candidate-block selection/filtering,
+  compact prefill carry, and sparse KV gather.
+* Indexer scores, indexer top-k, F16 row projections, attention output, and the
+  fused HC RMS-scale projection reuse the existing CUDA kernels.
+
+V4.1 on CUDA uses the F32 GLM indexer fallback; the packed tensor-core indexer
+path remains Metal-only. V4.1 tensor parallelism is not wired for CUDA yet
+(sessions keep `tp_world = 1`). While porting, the shared indexed-attention
+kernel was also hardened: it now masks top-k rows whose id is negative or
+beyond the row's causal visible count instead of dereferencing them, which is
+what V4.1's padded selection produces.
+
+The primitives are covered by the CPU-oracle test
+`make test-deepseek41-cuda` (quantization, RoPE, Engram gate, pooling,
+candidate selection, gather, index scores, projections, top-k, carry, and
+attention output). Full end-to-end V4.1 generation has not been run here
+because the released checkpoint is hundreds of GiB; treat the path as
+experimental until it is validated on a real V4.1 GGUF.
+
+---
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
 a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
-**DeepSeek V4.1 Flash** (Metal only),
+**DeepSeek V4.1 Flash** (Metal and CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
 **DeepSeek V4 PRO**. The code is self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
@@ -23,7 +122,7 @@ The repository also includes tools and data for GGUF, imatrix, quality, and spee
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
   can use SSD streaming. SSD streaming is also needed in order to run very
   large models such as full GLM 5.x (not Flash) on 128GB systems.
-* **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
+* **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards. **In this fork the CUDA backend is additionally tuned for Ampere (sm_80/sm_86), including single 12 GB cards running from NVMe via SSD streaming.**
 * **ROCm** on Strix Halo systems such as the Framework Desktop.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
@@ -164,11 +263,11 @@ the [client setup guide](docs/CLIENTS.md).
 requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash adds vision to the same text model.
 
-DeepSeek V4.1 Flash text and vision run on Metal. Q2 runs with SSD streaming
-on one 128 GB Mac, or resident across two using RDMA. Q4 needs SSD streaming
-or a 512 GB Mac. Engram tables remain on disk in every mode, so use a fast
-local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
-and setup.
+DeepSeek V4.1 Flash text runs on Metal and, in this fork, on CUDA/Ampere.
+Q2 runs with SSD streaming on one 128 GB Mac, or resident across two using
+RDMA. Q4 needs SSD streaming or a 512 GB Mac. Engram tables remain on disk in
+every mode, so use a fast local SSD. V4.1 vision is currently Metal-only. See
+the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads and setup.
 
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
