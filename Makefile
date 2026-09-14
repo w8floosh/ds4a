@@ -360,6 +360,13 @@ tests/test_deepseek41_cuda: tests/test_deepseek41_cuda.o $(CORE_OBJS)
 test-deepseek41-cuda: tests/test_deepseek41_cuda
 	./tests/test_deepseek41_cuda
 
+tests/test_expert_placement: tests/test_expert_placement.c ds4_expert_placement.c ds4_expert_placement.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_expert_placement.c ds4_expert_placement.c -lm
+
+.PHONY: test-expert-placement
+test-expert-placement: tests/test_expert_placement
+	./tests/test_expert_placement
+
 tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -855,6 +862,7 @@ clean:
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda
+	rm -f tests/test_expert_placement
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
 	rm -f tests/test_deepseek41_prefill

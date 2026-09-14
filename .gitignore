@@ -53,6 +53,7 @@
 /tests/test_deepseek4_vision_image
 /tests/test_deepseek41_metal
 /tests/test_deepseek41_cuda
+/tests/test_expert_placement
 /tests/test_deepseek41_gguf
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill

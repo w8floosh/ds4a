@@ -22386,6 +22386,14 @@ static bool metal_graph_decode_cuda_selected_load(
                                       sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
 
+    /* CUDA routing profiler: the selected ids are host-visible here, so the
+     * shared expert profile can collect real routing frequencies on CUDA. */
+    if (ok && g_expert_profile.active) {
+        float prof_weights[DS4_MAX_EXPERT_USED] = {0};
+        ds4_expert_profile_record(il, 0, selected_ids, prof_weights,
+                                  il < DS4_N_HASH_LAYER);
+    }
+
     if (ok) {
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
@@ -22467,6 +22475,15 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                   selected_ids,
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
+    if (ok && g_expert_profile.active) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            float prof_weights[DS4_MAX_EXPERT_USED] = {0};
+            ds4_expert_profile_record(il, t,
+                                      &selected_ids[(size_t)t * DS4_N_EXPERT_USED],
+                                      prof_weights,
+                                      il < DS4_N_HASH_LAYER);
+        }
+    }
     if (ok) {
         const ds4_gpu_stream_expert_table table =
             graph_stream_expert_table_make(model,
@@ -65788,11 +65805,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const char *expert_hotlist_path = getenv("DS4_EXPERT_HOTLIST");
     if ((expert_profile_path && expert_profile_path[0]) ||
         (expert_hotlist_path && expert_hotlist_path[0])) {
-        if (e->backend == DS4_BACKEND_METAL) {
+        if (e->backend == DS4_BACKEND_METAL ||
+            e->backend == DS4_BACKEND_CUDA) {
             ds4_expert_profile_init(expert_profile_path, expert_hotlist_path);
         } else {
             fprintf(stderr,
-                    "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
+                    "ds4: expert profile/hotlist is Metal/CUDA only for now; ignoring for %s backend\n",
                     ds4_backend_name(e->backend));
         }
     }
