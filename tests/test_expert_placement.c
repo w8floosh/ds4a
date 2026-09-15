@@ -263,9 +263,47 @@ static int profile_report(const char *path) {
     return 1;
 }
 
+static int sweep_report(const char *path) {
+    uint32_t n_layer = 0, n_expert = 0;
+    char err[256];
+    uint64_t *counts = ds4_placement_load_hotlist(path, &n_layer, &n_expert,
+                                                  err, sizeof(err));
+    CHECK(counts);
+    static const uint64_t gibs[] = {2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64};
+    printf("# capacity_GiB max_experts pinned_experts selection_cov%% "
+           "byte_cov%% decode_tps prefill_speedup\n");
+    for (size_t i = 0; i < sizeof(gibs) / sizeof(*gibs); i++) {
+        ds4_placement_config cfg;
+        ds4_placement_config_default(&cfg);
+        cfg.n_layer = n_layer;
+        cfg.n_expert = n_expert;
+        cfg.tier_capacity[DS4_TIER_RAM] = 55ull << 30;
+        cfg.tier_capacity[DS4_TIER_WARM_GPU] = gibs[i] << 30;
+        cfg.tier_capacity[DS4_TIER_HOT_GPU] = 0;
+        ds4_placement_result r;
+        CHECK(ds4_placement_solve(&cfg, counts, &r));
+        const uint64_t pinned =
+            r.tier_experts[DS4_TIER_WARM_GPU] + r.tier_experts[DS4_TIER_HOT_GPU];
+        printf("%4llu %5llu %5llu %8.2f %8.2f %8.2f %8.3f\n",
+               (unsigned long long)gibs[i],
+               (unsigned long long)((gibs[i] << 30) / cfg.expert_bytes),
+               (unsigned long long)pinned,
+               r.selection_coverage * 100.0,
+               r.vram_byte_coverage * 100.0,
+               r.placed_decode_tps,
+               r.vram_byte_coverage < 1.0
+                   ? 1.0 / (1.0 - r.vram_byte_coverage) : 0.0);
+        ds4_placement_result_free(&r);
+    }
+    free(counts);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--profile"))
         return profile_report(argv[2]) ? 0 : 1;
+    if (argc == 3 && !strcmp(argv[1], "--sweep"))
+        return sweep_report(argv[2]) ? 0 : 1;
     if (argc == 2 && !strcmp(argv[1], "--synthetic"))
         return synthetic_report() ? 0 : 1;
     if (argc != 1) {
