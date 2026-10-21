@@ -781,7 +781,7 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o ds4_profiler.o ds4_gpu_roles.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h

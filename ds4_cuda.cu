@@ -1205,6 +1205,12 @@ extern "C" int ds4_gpu_device_is_spark(void) {
  * destinations cannot race for staging memory. */
 static void   *g_xdev_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static size_t  g_xdev_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+/* Marks the end of the last host->device leg out of that pair's bounce buffer.
+ * A copy is asynchronous: the receiver's stream continues with the data, and
+ * the CPU moves on. The next copy into the same buffer therefore has to wait on
+ * this event *on the source stream* before the device->host leg overwrites it.
+ * That wait is a stream dependency, never a host block. */
+static cudaEvent_t g_xdev_bounce_free[DS4_MAX_GPUS][DS4_MAX_GPUS];
 
 /* Internal helper: resolve a tensor's device index. -1 (untagged) is
  * treated as device 0 for legacy callers. */
@@ -3912,14 +3918,28 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
 #endif
     }
-    for (int i = 0; i < DS4_MAX_GPUS; i++) {
-        for (int j = 0; j < DS4_MAX_GPUS; j++) {
-            if (g_xdev_bounce[i][j]) {
-                (void)cudaFreeHost(g_xdev_bounce[i][j]);
-                g_xdev_bounce[i][j] = NULL;
-                g_xdev_bounce_bytes[i][j] = 0;
+    {
+        int prev_dev = -1;
+        (void)cudaGetDevice(&prev_dev);
+        for (int i = 0; i < DS4_MAX_GPUS; i++) {
+            for (int j = 0; j < DS4_MAX_GPUS; j++) {
+                /* The event belongs to the receiver's device and marks the last
+                 * leg out of the buffer: it has to go first, with that device
+                 * current, or the pinned buffer could be freed under a copy. */
+                if (g_xdev_bounce_free[i][j]) {
+                    if (j < g_n_gpus) (void)cudaSetDevice(g_gpu[j].device_id);
+                    (void)cudaEventSynchronize(g_xdev_bounce_free[i][j]);
+                    (void)cudaEventDestroy(g_xdev_bounce_free[i][j]);
+                    g_xdev_bounce_free[i][j] = NULL;
+                }
+                if (g_xdev_bounce[i][j]) {
+                    (void)cudaFreeHost(g_xdev_bounce[i][j]);
+                    g_xdev_bounce[i][j] = NULL;
+                    g_xdev_bounce_bytes[i][j] = 0;
+                }
             }
         }
+        if (prev_dev >= 0) (void)cudaSetDevice(prev_dev);
     }
     cuda_stream_selected_cache_release();
     cuda_expert_pool_release();
@@ -4443,18 +4463,46 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
 
     /* Per-pair pinned-host bounce buffer. */
     if (g_xdev_bounce_bytes[sd][dd] < bytes) {
-        if (g_xdev_bounce[sd][dd]) (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+        if (g_xdev_bounce[sd][dd]) {
+            /* The old buffer may still be feeding a host->device leg. */
+            if (g_xdev_bounce_free[sd][dd]) {
+                WITH_DEVICE(g_gpu[dd].device_id) {
+                    (void)cudaEventSynchronize(g_xdev_bounce_free[sd][dd]);
+                }
+            }
+            (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+            g_xdev_bounce[sd][dd] = NULL;
+            g_xdev_bounce_bytes[sd][dd] = 0;
+        }
         if (!cuda_ok(cudaMallocHost(&g_xdev_bounce[sd][dd], (size_t)bytes),
-                     "bounce alloc")) return 0;
+                     "bounce alloc")) {
+            if (g_xdev_bounce[sd][dd]) {
+                (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+                g_xdev_bounce[sd][dd] = NULL;
+            }
+            return 0;
+        }
         g_xdev_bounce_bytes[sd][dd] = bytes;
+    }
+    if (!g_xdev_bounce_free[sd][dd]) {
+        /* The event is recorded on the receiver's stream, so it belongs to the
+         * receiver's device: CUDA binds an event to the device that was current
+         * when it was created. */
+        WITH_DEVICE(g_gpu[dd].device_id) {
+            if (!cuda_ok(cudaEventCreateWithFlags(&g_xdev_bounce_free[sd][dd],
+                                                  cudaEventDisableTiming),
+                         "bounce free event")) return 0;
+        }
     }
     int ok = 0;
     WITH_DEVICE(g_gpu[sd].device_id) {
         cudaStream_t s = (cudaStream_t)g_gpu[sd].stream;
         cudaEvent_t  e = (cudaEvent_t)g_gpu[sd].boundary_event;
-        ok = cuda_ok(cudaMemcpyAsync(g_xdev_bounce[sd][dd], src->ptr, bytes,
-                                     cudaMemcpyDeviceToHost, s),
-                      "bounce d2h");
+        ok = cuda_ok(cudaStreamWaitEvent(s, g_xdev_bounce_free[sd][dd], 0),
+                     "bounce reuse wait");
+        if (ok) ok = cuda_ok(cudaMemcpyAsync(g_xdev_bounce[sd][dd], src->ptr,
+                                             bytes, cudaMemcpyDeviceToHost, s),
+                             "bounce d2h");
         if (ok) ok = cuda_ok(cudaEventRecord(e, s), "bounce event record");
     }
     if (!ok) return 0;
@@ -4464,8 +4512,12 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
         ok = cuda_ok(cudaMemcpyAsync(dst->ptr, g_xdev_bounce[sd][dd], bytes,
                                      cudaMemcpyHostToDevice, s2),
                       "bounce h2d");
-        if (ok) ok = cuda_ok(cudaStreamSynchronize(s2), "bounce dst sync");
+        if (ok)
+            ok = cuda_ok(cudaEventRecord(g_xdev_bounce_free[sd][dd], s2),
+                         "bounce free record");
     }
+    /* No host wait: the receiver's stream owns the ordering from here, the
+     * same contract the peer path above keeps. */
     return ok;
 }
 
@@ -4532,10 +4584,32 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
     }
 
     if (g_xdev_bounce_bytes[sd][dd] < bytes) {
-        if (g_xdev_bounce[sd][dd]) (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+        if (g_xdev_bounce[sd][dd]) {
+            if (g_xdev_bounce_free[sd][dd]) {
+                WITH_DEVICE(g_gpu[dd].device_id) {
+                    (void)cudaEventSynchronize(g_xdev_bounce_free[sd][dd]);
+                }
+            }
+            (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+            g_xdev_bounce[sd][dd] = NULL;
+            g_xdev_bounce_bytes[sd][dd] = 0;
+        }
         if (!cuda_ok(cudaMallocHost(&g_xdev_bounce[sd][dd], (size_t)bytes),
-                     "default-stream bounce alloc")) return 0;
+                     "default-stream bounce alloc")) {
+            if (g_xdev_bounce[sd][dd]) {
+                (void)cudaFreeHost(g_xdev_bounce[sd][dd]);
+                g_xdev_bounce[sd][dd] = NULL;
+            }
+            return 0;
+        }
         g_xdev_bounce_bytes[sd][dd] = bytes;
+    }
+    /* This path blocks on the host anyway, so it can simply wait for the last
+     * asynchronous leg out of the buffer instead of adding an event wait. */
+    if (g_xdev_bounce_free[sd][dd]) {
+        WITH_DEVICE(g_gpu[dd].device_id) {
+            (void)cudaEventSynchronize(g_xdev_bounce_free[sd][dd]);
+        }
     }
     int ok = 0;
     WITH_DEVICE(g_gpu[sd].device_id) {
