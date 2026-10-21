@@ -69,8 +69,8 @@ typedef enum {
     K_NONE = 0, K_CHAR, K_ENTER, K_BACKSPACE, K_DELETE, K_LEFT, K_RIGHT,
     K_UP, K_DOWN, K_PGUP, K_PGDN, K_HOME, K_END, K_TAB, K_STAB, K_ESC,
     K_CTRL_A, K_CTRL_B, K_CTRL_C, K_CTRL_D, K_CTRL_E, K_CTRL_K, K_CTRL_L,
-    K_CTRL_U, K_CTRL_W, K_CTRL_N, K_CTRL_P, K_ALT_1, K_ALT_2, K_ALT_3,
-    K_ALT_4
+    K_CTRL_U, K_CTRL_W, K_CTRL_N, K_CTRL_P, K_CTRL_Y, K_ALT_1, K_ALT_2,
+    K_ALT_3, K_ALT_4, K_PASTE
 } tui_key;
 
 typedef enum {
@@ -138,6 +138,12 @@ struct ds4_tui {
     char *history[TUI_HIST];
     int hist_n, hist_pos;
     char prompt[64];
+    /* Bracketed paste: the terminal frames a paste with ESC[200~ .. ESC[201~,
+     * so a pasted newline is data, not a keypress. The frame can arrive over
+     * several reads, hence the buffer lives in the TUI. */
+    int pasting;
+    char *paste;
+    size_t paste_len, paste_cap;
     int busy;
     char status[160];
     int dirty;
@@ -462,7 +468,7 @@ static int term_init(ds4_tui *t) {
     fcntl(STDIN_FILENO, F_SETFL, t->orig_flags | O_NONBLOCK);
     /* The first frame clears; clearing twice at startup makes slow terminals
      * show a blank flash right before the UI appears. */
-    fputs("\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[0m", stdout);
+    fputs("\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[?2004h\x1b[0m", stdout);
     fflush(stdout);
     return 1;
 }
@@ -479,7 +485,7 @@ static void term_done(ds4_tui *t) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &t->orig);
         t->term_saved = 0;
     }
-    fputs("\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l", stdout);
+    fputs("\x1b[0m\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l", stdout);
     fflush(stdout);
 }
 
@@ -1824,8 +1830,11 @@ static void build_help(ds4_tui *t) {
     doc_line(d, ST_NORMAL, " Ctrl-B            breakpoints: pause after each token/chunk");
     doc_line(d, ST_NORMAL, " Space / c / b     continue; b also drops breakpoints");
     doc_line(d, ST_NORMAL, " ?                 this card, from any pane");
+    doc_line(d, ST_NORMAL, " Ctrl-Y            copy the focused pane to the clipboard");
     doc_line(d, ST_NORMAL, " chat: Enter sends, Ctrl-P/N move in the transcript,");
     doc_line(d, ST_NORMAL, " Ctrl-U pages it, Ctrl-C clears the line, Ctrl-D exits.");
+    doc_line(d, ST_GRAY, " Chat takes bracketed pastes: multi-line text arrives as");
+    doc_line(d, ST_GRAY, " one line, so a paste never runs the UI's keys.");
     doc_line(d, ST_GRAY, " A row wider than its pane slides sideways while it is the");
     doc_line(d, ST_GRAY, " selected row, and returns to column 0 when it is not.");
     if (t->pv == PV_DETAIL && t->view && t->detail_ready && t->detail.stage_n) {
@@ -2108,6 +2117,20 @@ static int read_byte(ds4_tui *t) {
     return -1;
 }
 
+/* Escape sequences and bracketed pastes arrive as one write, but stdin is
+ * nonblocking: without the wait, a lone ESC byte would split ESC[200~ into
+ * ESC followed by typed text. The wait is short enough to keep the key path
+ * responsive. */
+static int read_byte_wait(ds4_tui *t, int ms) {
+    for (int waited = 0; waited <= ms; waited++) {
+        int c = read_byte(t);
+        if (c >= 0) return c;
+        struct timespec ts = { 0, 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
 static tui_key read_key(ds4_tui *t, char *utf8, size_t *ulen) {
     int c = read_byte(t);
     *ulen = 0;
@@ -2123,14 +2146,15 @@ static tui_key read_key(ds4_tui *t, char *utf8, size_t *ulen) {
     if (c == 23) return K_CTRL_W;
     if (c == 14) return K_CTRL_N;
     if (c == 16) return K_CTRL_P;
+    if (c == 25) return K_CTRL_Y;
     if (c == 9) return K_TAB;
     if (c == 13 || c == 10) return K_ENTER;
     if (c == 127 || c == 8) return K_BACKSPACE;
     if (c == 27) {
-        int c2 = read_byte(t);
+        int c2 = read_byte_wait(t, 25);
         if (c2 < 0) return K_ESC;
         if (c2 == '[') {
-            int c3 = read_byte(t);
+            int c3 = read_byte_wait(t, 25);
             if (c3 < 0) return K_ESC;
             if (c3 == 'A') return K_UP;
             if (c3 == 'B') return K_DOWN;
@@ -2140,17 +2164,26 @@ static tui_key read_key(ds4_tui *t, char *utf8, size_t *ulen) {
             if (c3 == 'F') return K_END;
             if (c3 == 'Z') return K_STAB;
             if (c3 >= '0' && c3 <= '9') {
-                int c4 = read_byte(t);
+                int c4 = read_byte_wait(t, 25);
                 if (c4 == '~') {
                     if (c3 == '1' || c3 == '7') return K_HOME;
                     if (c3 == '3') return K_DELETE;
                     if (c3 == '4' || c3 == '8') return K_END;
                     if (c3 == '5') return K_PGUP;
                     if (c3 == '6') return K_PGDN;
+                } else if (c3 == '2' && c4 == '0') {
+                    /* ESC [ 2 0 0 ~ starts a paste, ESC [ 2 0 1 ~ ends one;
+                     * a stray end marker is dropped. */
+                    int c5 = read_byte_wait(t, 25);
+                    if (c5 == '0' || c5 == '1') {
+                        if (read_byte_wait(t, 25) == '~')
+                            return c5 == '0' ? K_PASTE : K_NONE;
+                    }
+                    return K_NONE;
                 } else if (c4 == ';') {
                     /* Modifier sequences: ESC [ 1 ; 5 A etc. Consume the
                      * final byte and treat as the base key. */
-                    int c5 = read_byte(t);
+                    int c5 = read_byte_wait(t, 25);
                     (void)c5;
                 }
             }
@@ -2296,6 +2329,135 @@ static void cursor_edge(ds4_tui *t, int last) {
     t->dirty = 1;
 }
 
+/* A paste is text, never keystrokes: newlines inside it become spaces, so a
+ * multi-line paste lands on one chat line instead of submitting on its first
+ * newline and spraying the rest into the next prompt. Control bytes are
+ * dropped. */
+static void paste_flush(ds4_tui *t) {
+    t->pasting = 0;
+    if (t->paste_len == 0) {
+        free(t->paste);
+        t->paste = NULL;
+        t->paste_cap = 0;
+        return;
+    }
+    sbuf text;
+    memset(&text, 0, sizeof(text));
+    for (size_t i = 0; i < t->paste_len; i++) {
+        unsigned char c = (unsigned char)t->paste[i];
+        if (c == '\r' || c == '\n' || c == '\t') { sb_add(&text, " ", 1); continue; }
+        if (c < 0x20 || c == 0x7f) continue;
+        sb_add(&text, (const char *)&c, 1);
+    }
+    if (text.len == 0) {
+        ds4_tui_log(t, 0, "paste held no text (%zu bytes dropped)", t->paste_len);
+    } else if (t->busy || (t->focus != DS4_TUI_CHAT && !t->readline)) {
+        ds4_tui_log(t, 1, "paste of %zu bytes ignored: chat pane is not taking input",
+                    text.len);
+    } else {
+        input_insert(t, text.s, text.len);
+        ds4_tui_log(t, 0, "pasted %zu bytes into the chat line", text.len);
+    }
+    free(text.s);
+    free(t->paste);
+    t->paste = NULL;
+    t->paste_len = 0;
+    t->paste_cap = 0;
+    t->dirty = 1;
+}
+
+/* One byte of a bracketed paste; returns 0 when the input has nothing more to
+ * give right now, so a large paste can span several pumps. */
+static int paste_step(ds4_tui *t) {
+    int c = read_byte_wait(t, 5);
+    if (c < 0) return 0;
+    if (t->paste_len + 8 > t->paste_cap) {
+        size_t cap = t->paste_cap ? t->paste_cap * 2 : 4096;
+        char *p = realloc(t->paste, cap);
+        if (!p) { t->pasting = 0; return 0; }
+        t->paste = p;
+        t->paste_cap = cap;
+    }
+    t->paste[t->paste_len++] = (char)c;
+    if (t->paste_len > 262144) {          /* a paste, not a stream */
+        paste_flush(t);
+        return 0;
+    }
+    static const char end[] = "\x1b[201~";
+    const size_t elen = sizeof(end) - 1;
+    if (t->paste_len >= elen && memcmp(t->paste + t->paste_len - elen, end, elen) == 0) {
+        t->paste_len -= elen;
+        paste_flush(t);
+    }
+    return 1;
+}
+
+static void b64_add(sbuf *b, const char *s, size_t n) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)(unsigned char)s[i] << 16;
+        if (i + 1 < n) v |= (unsigned)(unsigned char)s[i + 1] << 8;
+        if (i + 2 < n) v |= (unsigned char)s[i + 2];
+        char out[4];
+        out[0] = tab[(v >> 18) & 63];
+        out[1] = tab[(v >> 12) & 63];
+        out[2] = (char)(i + 1 < n ? tab[(v >> 6) & 63] : '=');
+        out[3] = (char)(i + 2 < n ? tab[v & 63] : '=');
+        sb_add(b, out, 4);
+    }
+}
+
+/* Ctrl-Y hands the focused pane to the terminal clipboard over OSC 52. Mouse
+ * selection only ever sees the cells currently on screen and loses them as the
+ * panes repaint, and the alternate screen never reaches the scrollback, so
+ * this is the way to take text out of the UI (tmux needs set-clipboard on). */
+static void copy_focused(ds4_tui *t) {
+    const char *name = t->focus == DS4_TUI_CHAT ? "chat" :
+                       t->focus == DS4_TUI_PROFILER ? "profiler" :
+                       t->focus == DS4_TUI_MESSAGES ? "console" : "help";
+    sbuf text;
+    memset(&text, 0, sizeof(text));
+    if (t->focus == DS4_TUI_PROFILER) {
+        /* The profiler scrolls a wrapped doc, so copy what is on screen. */
+        int n = 0;
+        const int w = t->prof_cols > 0 ? t->prof_cols : 1;
+        const vis_line *lines = doc_wrap(&t->prof, w, &n);
+        int first = t->prof_scroll;
+        if (first > n - 1) first = n - 1;
+        if (first < 0) first = 0;
+        for (int i = first; i < first + t->prof_rows && i < n; i++) {
+            sb_add(&text, t->prof.s + lines[i].off, lines[i].len);
+            sb_add(&text, "\n", 1);
+        }
+    } else {
+        tui_doc *d = t->focus == DS4_TUI_CHAT ? &t->chat :
+                     t->focus == DS4_TUI_MESSAGES ? &t->msg : &t->help;
+        size_t take = d->len < 131072 ? d->len : 131072;   /* OSC 52 is small */
+        if (take) sb_add(&text, d->s, take);
+    }
+    if (text.len == 0) {
+        ds4_tui_log(t, 1, "nothing to copy in the %s pane", name);
+        free(text.s);
+        return;
+    }
+    size_t n = text.len;
+    int cut = 0;
+    if (n > 131072) { n = 131072; cut = 1; }   /* OSC 52 payloads have limits */
+    sbuf b64;
+    memset(&b64, 0, sizeof(b64));
+    b64_add(&b64, text.s, n);
+    fputs("\x1b]52;c;", stdout);
+    fwrite(b64.s, 1, b64.len, stdout);
+    fputc('\a', stdout);
+    fflush(stdout);
+    ds4_tui_log(t, 0, "copied %s pane to the clipboard (%zu bytes%s)", name, n,
+                cut ? ", truncated" : "");
+    ds4_tui_status(t, "copied %s to the clipboard", name);
+    free(b64.s);
+    free(text.s);
+}
+
 static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
     /* Global pane switching. */
     if (k == K_TAB || k == K_STAB) {
@@ -2313,6 +2475,7 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
     if (k == K_ALT_3) { t->focus = DS4_TUI_MESSAGES; t->dirty = 1; return; }
     if (k == K_ALT_4) { t->focus = DS4_TUI_HELP; t->dirty = 1; return; }
     if (k == K_CTRL_L) { t->dirty = 1; return; }
+    if (k == K_CTRL_Y) { copy_focused(t); return; }
     if (k == K_CTRL_B) {
         t->breakpoints = !t->breakpoints;
         if (t->paused) t->paused = 0;
@@ -2668,6 +2831,7 @@ void ds4_tui_destroy(ds4_tui *t) {
     screen_drop_prev(&t->scr);
     free(t->scr.cells);
     free(t->input);
+    free(t->paste);
     free(t->view);
     for (int i = 0; i < t->hist_n; i++) free(t->history[i]);
     if (t->pipe_r >= 0) close(t->pipe_r);
@@ -2774,9 +2938,19 @@ void ds4_tui_pump(ds4_tui *t) {
             if (t->readline) { input_set(t, ""); t->hist_pos = 0; }
             continue;
         }
+        if (k == K_PASTE) {
+            /* The bytes after the marker are text, not keys: stop decoding
+             * and let the drain below take them. */
+            t->pasting = 1;
+            t->paste_len = 0;
+            break;
+        }
         handle_key(t, k, utf8, ul);
         if (t->submitted || t->eof) break;
     }
+    /* A paste is drained outside the key loop: the bytes are text, and a big
+     * one can arrive over several pumps. */
+    while (t->pasting && paste_step(t)) { }
     const double now = tui_now();
     if (now - t->last_size_check >= 0.10) {
         t->last_size_check = now;

@@ -23,7 +23,8 @@ int main(void) {
         ds4_tui_set_busy(t, 1, "synthetic");
         ds4_tui_breakpoint(t, "synthetic token");
     }
-    ds4_tui_set_busy(t, 1, "synthetic");
+    /* Idle mode leaves the chat line open, so a pty test can type into it. */
+    if (!getenv("DS4_TUI_FAKE_IDLE")) ds4_tui_set_busy(t, 1, "synthetic");
     int iters = 60;
     if (getenv("DS4_TUI_FAKE_ITERS")) {
         int v = atoi(getenv("DS4_TUI_FAKE_ITERS"));

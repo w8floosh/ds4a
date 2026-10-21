@@ -75,7 +75,9 @@ reads, so this fork adds:
   aggregate cost, a compact token/prefill-chunk list, a full per-record detail
   page, live devices (nvtop-style), and expert residency. The help pane follows
   the visible profiler view with an explanation of its numbers and lists every
-  hotkey. Records and events are also served as JSON to the optional browser
+  hotkey. `Ctrl-Y` copies the focused pane to the terminal clipboard over OSC 52
+  (`set-clipboard on` in tmux), and the chat line accepts bracketed pastes as one
+  paste instead of a burst of keys. Records and events are also served as JSON to the optional browser
   dashboard (`--dashboard-lan`/`--dashboard-bind`).
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
