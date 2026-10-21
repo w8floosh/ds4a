@@ -153,9 +153,15 @@ typedef struct {
     uint64_t upload_wait_ns;   /* blocked on the expert upload stream        */
     uint64_t readback_ns;      /* blocked on device->host tensor reads       */
     uint64_t host_read_ns;     /* blocked in the host expert read pool        */
+    uint64_t boundary_wait_ns; /* of device_wait: stage-profiler boundaries   */
 } ds4_gpu_phases;
 
 void ds4_gpu_phase_snapshot(ds4_gpu_phases *out);
+
+/* Bracket a stage-profiler boundary: the profiler ends the command stream and
+ * waits there, so the backend charges that wait apart from the engine's own. */
+void ds4_gpu_stage_boundary_sync_begin(void);
+void ds4_gpu_stage_boundary_sync_end(void);
 
 /* Cheap machine counters for the per-token record. Unlike
  * ds4_gpu_profiler_stats(), this touches no device state (no cudaMemGetInfo,
@@ -511,6 +517,8 @@ typedef struct {
     ds4_prof_stat device_upload_ms;      /*   of which: expert upload stream       */
     ds4_prof_stat device_readback_ms;    /*   of which: device->host tensor reads  */
     ds4_prof_stat device_sync_ms;        /*   of which: other synchronisation      */
+    ds4_prof_stat profiler_ms;           /*   of which: the profiler's own cost    */
+    ds4_prof_stat profiler_sync_ms;      /*   of which: stage-boundary device syncs*/
     ds4_prof_stat weight_transfer_ms;    /* reference: bytes at the link peak      */
     ds4_prof_stat activation_transfer_ms;/* reference: bytes at the link peak      */
     ds4_prof_stat tokens_per_s;

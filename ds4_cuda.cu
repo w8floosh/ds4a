@@ -900,6 +900,8 @@ static uint64_t g_prof_ssd_read_bytes;
  * blocked call, which is noise next to the calls themselves. */
 static uint64_t g_prof_device_wait_ns;   /* all blocking device waits */
 static uint64_t g_prof_upload_wait_ns;   /* part: expert upload stream sync */
+static uint64_t g_prof_boundary_wait_ns; /* part: stage-profiler boundaries */
+static uint64_t g_prof_boundary_t0;
 static uint64_t g_prof_readback_ns;      /* part: blocking D2H tensor reads */
 static uint64_t g_prof_host_read_ns;     /* CPU blocked in the host read pool */
 static inline uint64_t prof_now_ns(void) {
@@ -1156,8 +1158,23 @@ extern "C" uint64_t ds4_gpu_pcie_peak_bps(int tier) {
     return (tier >= 0 && tier < DS4_MAX_GPUS) ? g_prof_pcie_max_bps[tier] : 0;
 }
 
+/* Device time spent inside stage-profiler boundaries. The profiler ends the
+ * command stream and waits at every stage so each number covers encode plus
+ * execution; that serialises the pipeline, so it is charged apart from the
+ * engine's own waits instead of hiding in them. */
+extern "C" void ds4_gpu_stage_boundary_sync_begin(void) {
+    g_prof_boundary_t0 = prof_now_ns();
+}
+extern "C" void ds4_gpu_stage_boundary_sync_end(void) {
+    const uint64_t now = prof_now_ns();
+    if (g_prof_boundary_t0 != 0 && now > g_prof_boundary_t0)
+        g_prof_boundary_wait_ns += now - g_prof_boundary_t0;
+    g_prof_boundary_t0 = 0;
+}
+
 extern "C" void ds4_gpu_phase_snapshot(ds4_gpu_phases *out) {
     if (!out) return;
+    out->boundary_wait_ns = g_prof_boundary_wait_ns;
     out->device_wait_ns = g_prof_device_wait_ns;
     out->upload_wait_ns = g_prof_upload_wait_ns;
     out->readback_ns = g_prof_readback_ns;

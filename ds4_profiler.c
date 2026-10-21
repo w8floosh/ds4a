@@ -180,7 +180,24 @@ static const struct {
         "CPU blocked on any other device sync (graph completion, event waits).", "wait"},
 };
 
+static uint64_t monotonic_ns(void);
+
 static ds4_prof_step_stat g_steps[DS4_PSTEP_COUNT];
+
+/* Time the profiler itself spent on the token path, charged to its own row so
+ * the cost of measuring stays visible instead of silently inflating the other
+ * rows. Written by whichever thread records (decode thread, pread pool), read
+ * once per token, so a relaxed atomic keeps the hot path lock-free. */
+static uint64_t g_self_ns;
+
+static void prof_self_add(uint64_t dt) {
+    if (dt == 0) return;
+#if defined(_MSC_VER)
+    g_self_ns += dt;
+#else
+    __atomic_fetch_add(&g_self_ns, dt, __ATOMIC_RELAXED);
+#endif
+}
 
 /* Expert-usage ring: one record per (token, layer, expert). The write index
  * wraps, so the snapshot is rotated back into chronological order. */
@@ -204,6 +221,7 @@ void ds4_profiler_trace_token(uint32_t token_seq) {
 void ds4_profiler_trace_expert(uint16_t layer, uint16_t expert,
                                uint8_t source, uint8_t src_gpu,
                                uint8_t dest_gpu, uint32_t bytes) {
+    const uint64_t self_t0 = monotonic_ns();
     LOCK();
     ds4_prof_expert_trace *e = &g_experts[g_expert_next_seq % DS4_PTRACE_EXPERT_RING];
     memset(e, 0, sizeof(*e));
@@ -220,6 +238,7 @@ void ds4_profiler_trace_expert(uint16_t layer, uint16_t expert,
     if (g_experts_count < DS4_PTRACE_EXPERT_RING) g_experts_count++;
     current_rec_note_expert_locked();
     UNLOCK();
+    prof_self_add(monotonic_ns() - self_t0);
 }
 
 int ds4_profiler_trace_snapshot(ds4_prof_expert_trace *out, int max) {
@@ -496,7 +515,7 @@ static ds4_gpu_phases   g_tok_ph0;
 static ds4_gpu_transfer g_tok_prev[DS4_PROFILER_MAX_DEV];
 static int              g_tok_prev_n;
 static int              g_tok_open;
-static void timing_note_token(uint64_t tokens);
+static void timing_note_token(uint64_t tokens, uint64_t self_ns);
 
 static uint64_t current_rec_seq_locked(void) {
     return g_cur.open ? g_cur.seq : 0;
@@ -821,6 +840,7 @@ void ds4_profiler_set_record_enabled(int on) {
 int ds4_profiler_token_begin_ex(ds4_prof_rec_kind kind, int token,
                                 int pos, uint32_t n_tokens) {
     if (!g_record_enabled) return 0;
+    const uint64_t self_t0 = monotonic_ns();
     LOCK();
     if (g_cur.open) { UNLOCK(); return 0; }
     UNLOCK();
@@ -858,6 +878,7 @@ int ds4_profiler_token_begin_ex(ds4_prof_rec_kind kind, int token,
     ds4_gpu_phase_snapshot(&g_tok_ph0);
     g_tok_prev_n = ds4_gpu_transfer_snapshot(g_tok_prev, DS4_PROFILER_MAX_DEV);
     UNLOCK();
+    prof_self_add(monotonic_ns() - self_t0);
     return 1;
 }
 
@@ -883,6 +904,14 @@ void ds4_profiler_token_begin(void) {
 void ds4_profiler_token_end(uint64_t tokens) {
     if (!g_cur.open) return;
     if (tokens == 0) tokens = 1;
+
+    /* Charge the bookkeeping recorded since the last token end to its own
+     * line. This function's own cost lands in the next token's sample, which
+     * is what keeps the flush from measuring itself. */
+    LOCK();
+    const uint64_t self_ns = g_self_ns;
+    g_self_ns = 0;
+    UNLOCK();
 
     sys_sample sys1;
     ds4_gpu_machine m1;
@@ -981,7 +1010,7 @@ void ds4_profiler_token_end(uint64_t tokens) {
 
     dev_state_publish(devs1.dev, devs1.dev_n);
     trace_write_record(&rec);
-    timing_note_token(tokens);
+    timing_note_token(tokens, self_ns);
 }
 
 int ds4_profiler_token_rec_snapshot(ds4_prof_token_rec *out, int max) {
@@ -1097,19 +1126,22 @@ int ds4_profiler_record_experts(uint64_t seq, ds4_prof_expert_trace *out, int ma
 void ds4_profiler_note_step(ds4_prof_step step, uint64_t ns,
                             uint64_t count, uint64_t bytes) {
     if ((unsigned)step >= (unsigned)DS4_PSTEP_COUNT) return;
+    const uint64_t self_t0 = monotonic_ns();
     LOCK();
     g_steps[step].ns += ns;
     g_steps[step].count += count;
     g_steps[step].bytes += bytes;
     UNLOCK();
-    if (!g_stage_capture) return;
-    const char *cat = ds4_profiler_step_category(step);
-    const uint64_t enc = !strcmp(cat, "wait") || !strcmp(cat, "transfer") ? 0 : ns;
-    const uint64_t wait = enc == 0 ? ns : 0;
-    stage_note_ex(cat, ds4_profiler_step_id(step),
-                  ds4_profiler_step_label(step),
-                  ds4_profiler_step_hint(step), cat, 0,
-                  ns, enc, wait, bytes);
+    if (g_stage_capture) {
+        const char *cat = ds4_profiler_step_category(step);
+        const uint64_t enc = !strcmp(cat, "wait") || !strcmp(cat, "transfer") ? 0 : ns;
+        const uint64_t wait = enc == 0 ? ns : 0;
+        stage_note_ex(cat, ds4_profiler_step_id(step),
+                      ds4_profiler_step_label(step),
+                      ds4_profiler_step_hint(step), cat, 0,
+                      ns, enc, wait, bytes);
+    }
+    prof_self_add(monotonic_ns() - self_t0);
 }
 
 void ds4_profiler_step_snapshot(ds4_prof_step_stat *out, int n) {
@@ -1160,7 +1192,7 @@ void ds4_profiler_reset_timing(void) {
 
 /* ---- coarse per-token timing -------------------------------------------- */
 
-static void timing_note_token(uint64_t tokens) {
+static void timing_note_token(uint64_t tokens, uint64_t self_ns) {
     const double now = monotonic_sec();
     if (!g_tok_open) return;
     g_tok_open = 0;
@@ -1201,15 +1233,19 @@ static void timing_note_token(uint64_t tokens) {
     double d_upload    = PH_DELTA(upload_wait_ns);
     double d_readback  = PH_DELTA(readback_ns);
     double h_read      = PH_DELTA(host_read_ns);
+    double p_sync      = PH_DELTA(boundary_wait_ns);
 #undef PH_DELTA
     if (device_wait > per_token) device_wait = per_token;
     if (device_wait < 0.0) device_wait = 0.0;
     double host = per_token - device_wait;
     if (host < 0.0) host = 0.0;
-    /* Split the device time into upload, readback and the rest of the syncs. */
+    /* Split the device time into upload, readback, the stage profiler's own
+     * boundaries and the rest of the syncs. */
     if (d_upload > device_wait) d_upload = device_wait;
     if (d_readback > device_wait - d_upload) d_readback = device_wait - d_upload;
-    double d_sync = device_wait - d_upload - d_readback;
+    if (p_sync > device_wait - d_upload - d_readback)
+        p_sync = device_wait - d_upload - d_readback;
+    double d_sync = device_wait - d_upload - d_readback - p_sync;
     if (d_sync < 0.0) d_sync = 0.0;
     /* Split the host time into the expert read/staging wait and the rest. */
     if (h_read > host) h_read = host;
@@ -1223,6 +1259,10 @@ static void timing_note_token(uint64_t tokens) {
     stat_add(&g_timing.device_upload_ms, d_upload);
     stat_add(&g_timing.device_readback_ms, d_readback);
     stat_add(&g_timing.device_sync_ms, d_sync);
+    /* The profiler's own bookkeeping, measured where it happens. It is part of
+     * host time, so this is a slice of the total, not an extra term. */
+    stat_add(&g_timing.profiler_ms, (double)self_ns / 1e6 / tk);
+    stat_add(&g_timing.profiler_sync_ms, p_sync);
     stat_add(&g_timing.weight_transfer_ms, weight_ms);
     stat_add(&g_timing.activation_transfer_ms, act_ms);
     stat_add(&g_timing.tokens_per_s, per_token > 0.0 ? 1000.0 / per_token : 0.0);
@@ -1614,6 +1654,8 @@ size_t ds4_profiler_json(char *buf, size_t buflen) {
     jstat(&j, "device_upload_ms", &t.device_upload_ms);      jraw(&j, ",");
     jstat(&j, "device_readback_ms", &t.device_readback_ms);  jraw(&j, ",");
     jstat(&j, "device_sync_ms", &t.device_sync_ms);          jraw(&j, ",");
+    jstat(&j, "profiler_ms", &t.profiler_ms);                jraw(&j, ",");
+    jstat(&j, "profiler_sync_ms", &t.profiler_sync_ms);      jraw(&j, ",");
     jstat(&j, "weight_transfer_ms", &t.weight_transfer_ms);  jraw(&j, ",");
     jstat(&j, "activation_transfer_ms", &t.activation_transfer_ms); jraw(&j, ",");
     jstat(&j, "tokens_per_s", &t.tokens_per_s);              jraw(&j, ",");
@@ -2395,6 +2437,25 @@ size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit) {
          hm, pt > 0.0 ? 100.0 * hm / pt : 0.0,
          dw, pt > 0.0 ? 100.0 * dw / pt : 0.0,
          pt - hm - dw > 0.0 ? pt - hm - dw : 0.0);
+    /* The profiler's own slice of the host time, printed apart from the work it
+     * measures: a 60 ms stage sum means something different when 5 ms of it is
+     * the recording. */
+    if (t->profiler_ms.n) {
+        const double pf = dtok > 0.0 ? t->profiler_ms.sum / dtok : 0.0;
+        jfmt(&o, "  profiler overhead: %.3f ms/token (%.1f%% of the host time)\n",
+             pf, hm > 0.0 ? 100.0 * pf / hm : 0.0);
+    }
+    /* Stage capture ends the command stream at every boundary, so it serialises
+     * the pipeline. Its share of the token is the price of the per-stage table,
+     * and it is a different quantity from the recording cost above. */
+    if (t->profiler_sync_ms.n) {
+        const double ps = dtok > 0.0 ? t->profiler_sync_ms.sum / dtok : 0.0;
+        jfmt(&o, "  stage capture: %.2f ms/token in device syncs (%.1f%% of the "
+                 "token); capture %s, so turn it off (TUI: p) to measure the "
+                 "uninstrumented speed\n",
+             ps, pt > 0.0 ? 100.0 * ps / pt : 0.0,
+             ds4_profiler_stage_capture_enabled() ? "on" : "off");
+    }
     for (int d = 0; d < v.dev_n; d++) {
         const ds4_prof_dev_state *s = &v.dev[d];
         char m0[32], m1[32];

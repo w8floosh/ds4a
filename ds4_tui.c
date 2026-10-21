@@ -1334,7 +1334,8 @@ static void build_overview(ds4_tui *t) {
     doc_line(d, ST_TITLE, " D %.2f t/s  P %.2f t/s",
              ds4_prof_avg(&tm->tokens_per_s),
              ds4_prof_avg(&tm->prefill_tokens_per_s));
-    doc_line(d, ST_GRAY, " capture %s  n=%llu", t->granular ? "on" : "off",
+    doc_line(d, ST_GRAY, " capture %s  n=%llu  (p: per-stage detail costs "
+             "device syncs)", t->granular ? "on" : "off",
              (unsigned long long)tm->tokens);
 
     /* The newest decode token and the newest prefill chunk describe the same
@@ -1405,6 +1406,21 @@ static void build_overview(ds4_tui *t) {
         doc_line(dd, ST_NORMAL, "   wall %.2f ms/token", wall);
         doc_line(dd, ST_NORMAL, "   stage sum %.2f ms (%.0f%% of wall)",
                  dper, wall > 0 ? 100.0 * dper / wall : 0);
+        /* What the measurement costs: recording work plus the device sync at
+         * every stage boundary. Stage capture is what makes the per-stage table
+         * possible and what serialises the pipeline, so its price is named. */
+        if (tm->profiler_ms.n) {
+            const double pf = ds4_prof_avg(&tm->profiler_ms);
+            doc_line(dd, ST_GRAY, "   profiler %.2f ms/token (%.1f%% of host)",
+                     pf, ds4_prof_avg(&tm->host_ms) > 0.0
+                         ? 100.0 * pf / ds4_prof_avg(&tm->host_ms) : 0.0);
+        }
+        if (tm->profiler_sync_ms.n) {
+            const double ps = ds4_prof_avg(&tm->profiler_sync_ms);
+            doc_line(dd, ps > 1.0 ? ST_YELLOW : ST_GRAY,
+                     "   stage capture %.2f ms/token (%.1f%% of wall)", ps,
+                     wall > 0.0 ? 100.0 * ps / wall : 0.0);
+        }
         doc_line(dd, ST_GRAY, "   %s/token moved", bdt);
         doc_line(dd, ST_GRAY, "   %llu tokens counted",
                  (unsigned long long)tm->tokens);

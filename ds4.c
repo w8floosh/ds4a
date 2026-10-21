@@ -30695,7 +30695,10 @@ static bool metal_graph_indexer_stage_profile_boundary(
         uint32_t    n_comp,
         double     *stage_t0) {
     const double t_encoded = now_sec();
-    if (ds4_gpu_end_commands() == 0) return false;
+    ds4_gpu_stage_boundary_sync_begin();
+    const int ended = ds4_gpu_end_commands();
+    ds4_gpu_stage_boundary_sync_end();
+    if (ended == 0) return false;
     const double now = now_sec();
     if (stage != NULL && ds4_profiler_stage_capture_enabled()) {
         const uint64_t total_ns = (uint64_t)((now - *stage_t0) * 1e9);
@@ -30814,9 +30817,15 @@ static bool metal_graph_decode_stage_profile_enabled(uint32_t il) {
                 il);
 }
 
+/* The stage profiler ends the command stream and waits at every boundary, so
+ * the time it spends blocking is charged to the profiler (ds4_profiler.h),
+ * not to the engine's own waits. */
 static bool metal_graph_layer_stage_profile_start(uint32_t il) {
     if (!metal_graph_layer_stage_profile_enabled(il)) return true;
-    if (ds4_gpu_end_commands() == 0) return false;
+    ds4_gpu_stage_boundary_sync_begin();
+    const int ended = ds4_gpu_end_commands();
+    ds4_gpu_stage_boundary_sync_end();
+    if (ended == 0) return false;
     return ds4_gpu_begin_commands() != 0;
 }
 
@@ -30843,7 +30852,10 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0) {
     const double t_encoded = now_sec();
-    if (ds4_gpu_end_commands() == 0) return false;
+    ds4_gpu_stage_boundary_sync_begin();
+    const int ended = ds4_gpu_end_commands();
+    ds4_gpu_stage_boundary_sync_end();
+    if (ended == 0) return false;
     const double now = now_sec();
     if (stage != NULL && ds4_profiler_stage_capture_enabled()) {
         const uint64_t total_ns = (uint64_t)((now - *stage_t0) * 1e9);
@@ -30872,7 +30884,10 @@ static bool metal_graph_q_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0) {
     const double t_encoded = now_sec();
-    if (ds4_gpu_end_commands() == 0) return false;
+    ds4_gpu_stage_boundary_sync_begin();
+    const int ended = ds4_gpu_end_commands();
+    ds4_gpu_stage_boundary_sync_end();
+    if (ended == 0) return false;
     const double now = now_sec();
     if (ds4_profiler_stage_capture_enabled()) {
         const uint64_t total_ns = (uint64_t)((now - *stage_t0) * 1e9);
