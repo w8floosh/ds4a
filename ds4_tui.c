@@ -90,6 +90,11 @@ typedef enum {
     PV_OVERVIEW = 0, PV_TOKENS, PV_DETAIL, PV_DEVICES, PV_EXPERTS
 } prof_view;
 
+/* One decode token records thousands of ordered events (a boundary per stage,
+ * plus experts and transfers). The pane is a reader, not a dump, so it shows
+ * the start of the list and says so; the full list is in --profile-dump. */
+#define TUI_EVENT_ROWS 400
+
 /* Cell grid + per-row diff. Drawing into a grid and writing only changed
  * rows is what keeps the bottom pane and the profiler from flickering: the
  * terminal never sees a full-screen clear during normal updates. */
@@ -1984,12 +1989,31 @@ static void build_detail(ds4_tui *t) {
     }
     const ds4_prof_event *ev = t->detail_events;
     const int evn = t->detail_event_n;
-    doc_line(d, ST_TITLE, " Ordered events (%d)", evn);
-    if (dwide)
-        doc_line(d, ST_GRAY, "      us   duration  event                      layer expert dev      bytes");
+    /* The ring keeps a bounded history, and a record can outlive it: say which
+     * of the two empty cases this is instead of printing a bare zero. */
+    if (evn < (int)r.event_n)
+        doc_line(d, ST_TITLE, " Ordered events (%d of %u)", evn, r.event_n);
     else
+        doc_line(d, ST_TITLE, " Ordered events (%d)", evn);
+    if (evn == 0 && r.event_n) {
+        doc_line(d, ST_YELLOW,
+                 "  %u events were recorded, but newer tokens overwrote them: the"
+                 " ordered list follows the newest part of the history only",
+                 r.event_n);
+    } else if (evn == 0) {
+        doc_line(d, ST_GRAY,
+                 "  none recorded (stage capture was off when this record ran)");
+    }
+    if (evn > TUI_EVENT_ROWS) {
+        doc_line(d, ST_GRAY, "  showing the first %d; the rest are in the dump"
+                 " (--profile-dump)", TUI_EVENT_ROWS);
+    }
+    const int shown = evn > TUI_EVENT_ROWS ? TUI_EVENT_ROWS : evn;
+    if (shown > 0 && dwide)
+        doc_line(d, ST_GRAY, "      us   duration  event                      layer expert dev      bytes");
+    if (shown > 0 && !dwide)
         doc_line(d, ST_GRAY, "      us  dur.ms event      lay exp dv   bytes");
-    for (int i = 0; i < evn; i++) {
+    for (int i = 0; i < shown; i++) {
         const char *name = ds4_profiler_event_kind(ev[i].kind);
         if (ev[i].kind == DS4_PEV_STAGE && t->view &&
             ev[i].stage < (uint16_t)t->view->n_stages)

@@ -346,7 +346,11 @@ enum {
 };
 
 enum {
-    DS4_PEV_RING = 131072,   /* ~100 tokens of fully detailed events */
+    /* Sized to cover the record ring, not a guess: a decode token records about
+     * 3k events (one per stage boundary plus experts and transfers), and the
+     * record ring keeps 256 tokens, so a smaller ring emptied the ordered event
+     * list of every record older than the ring while the record itself stayed. */
+    DS4_PEV_RING = 1u << 20,
     DS4_PEV_DEV_MAX = 16
 };
 

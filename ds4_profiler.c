@@ -2101,6 +2101,9 @@ size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen) {
     ds4_profiler_format_bytes(b2, sizeof(b2), r.host_ram_used);
     jfmt(&o, "  ssd read %s  host ram %s  events %u%s%u\n", b1, b2, n_ev,
          n_ev < (int)r.event_n ? " of " : "", r.event_n);
+    if (n_ev < (int)r.event_n)
+        jraw(&o, "  (the event ring holds only the newest history; the rest of "
+                  "this record's events were overwritten)\n");
     jfmt(&o, "  cpu %.1f%% of a core over the record (process), %.1f%% machine busy\n",
          r.end_ns > r.start_ns
              ? 100.0 * (double)r.proc_cpu_ns / (double)(r.end_ns - r.start_ns) : 0.0,
