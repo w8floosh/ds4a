@@ -160,6 +160,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
     if (tool != DS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
+        opt(fp, c, "--force-primary-gpu N", "Force the decode/primary device by physical CUDA id. Default: auto-scored.");
+        opt(fp, c, "--force-cache-gpu N", "Force the expert-cache device by physical CUDA id. Default: auto-scored.");
+        opt(fp, c, "--disable-multi-gpu", "Force single-GPU mode even when several devices are present.");
+        opt(fp, c, "--kv-cache-location vram|ram|auto", "Preferred KV-cache home. gpu:N selects an explicit tier.");
+        opt(fp, c, "--chunk-size N", "SSD-streaming/prefill chunk target; alias for --prefill-chunk.");
     }
 #endif
     if (tool != DS4_HELP_BENCH) {
@@ -173,6 +178,15 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming cache target. N requests dynamic expert slots; NGB also reserves two full prefill layers. Either may be reduced to fit the model, graph, context, and backend working set.");
+    opt(fp, c, "--expert-arena NGB", "Pin NGB of the hottest routed experts in non-pageable host memory. A resident expert is uploaded with one DMA and no file read, and cannot be evicted by the kernel. Default: 7/8 of the RAM left after reserving a few GB of kernel/process headroom (1/16 of physical memory, at least 2GB, at most 8GB); 0 disables.");
+    opt(fp, c, "--expert-arena-preload NGB", "Cap the synchronous start-up fill of the expert arena; the rest fills from live reads as the session runs. 0 starts empty. Default: half the arena, at least 8GB.");
+    opt(fp, c, "--tui", "Interactive terminal UI: chat and profiler side by side, messages below. On by default when both ends are terminals.");
+    opt(fp, c, "--no-tui", "Use the classic line REPL instead of the terminal UI.");
+    opt(fp, c, "--dashboard-lan", "Serve the telemetry dashboard on the network (all interfaces) instead of loopback, so another machine can watch it. It has no authentication: trusted LANs only.");
+    opt(fp, c, "--dashboard-bind IP", "Serve the dashboard on one IPv4 address (implies network exposure; use --dashboard-lan for all interfaces).");
+    opt(fp, c, "--profile-dump FILE|-", "Write a profiler report when the run ends: decode/prefill rates, token time split, devices, expert-arena occupancy and headroom, per-kind stage tables, then the newest records with every stage, device and expert use in full detail. - writes it to stdout.");
+    opt(fp, c, "--profile-records N", "How many records --profile-dump details in full. Default: 8");
+    opt(fp, c, "--profile-kind decode|prefill|all", "Which records --profile-dump details. Default: all");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");

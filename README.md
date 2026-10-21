@@ -31,9 +31,49 @@ The upstream CUDA streaming path was written for the large unified-memory DGX
 Spark. On a 12 GB discrete card the bottleneck is VRAM, PCIe, and random NVMe
 reads, so this fork adds:
 
-* **Per-layer resident expert pools.** Sticky routing reuses recently selected
-  experts with device-to-device copies instead of host reads plus PCIe uploads.
-  Opt in with `DS4_CUDA_STREAM_RESIDENT=N` (N slots per layer).
+* **Global Least-Stale resident expert pool.** One VRAM slab across all layers
+  holds the hottest routed experts and reuses them with device-to-device copies
+  instead of host reads plus PCIe uploads. Eviction follows the Least-Stale
+  policy (arXiv 2602.03921): experts already used by the current forward pass
+  are protected, experts last used by an earlier pass are evicted first, oldest
+  use first, which avoids the collision misses plain LRU causes on a
+  front-to-back layer walk. `DS4_CUDA_STREAM_RESIDENT=auto` (the default) sizes
+  the pool from spare VRAM after the model arena settles; `N` fixes a total slot
+  count, `NGB` a byte budget, and the explicit forms also preload the built-in
+  hotlist before the first token. `DS4_CUDA_STREAM_RESIDENT_POLICY=lru` selects
+  pure recency for comparison. The pool is a pure speed cache: output is
+  bit-identical with it off, and it disables itself when VRAM is saturated. It
+  reports its decode hit rate on release (shutdown or self-disable), so the
+  resident-expert effectiveness is visible without a profiler. With
+  `--gpu-devices`, SSD streaming spreads the pinned pool across every GPU's
+  VRAM (one tier per device, primary first) so a run uses SSD, host RAM, and
+  all GPUs together; secondary tiers require a validated peer path.
+* **F16 compressed attention KV cache on CUDA.** The persistent per-layer
+  compressed attention cache is stored F16, matching Metal, which halves it:
+  about 0.17 / 0.34 / 0.68 GiB freed at 32k / 64k / 128k context. Producers keep
+  F32 staging and commit through `ds4_gpu_tensor_copy_f32_to_f16`; the CUDA
+  consumers expand the selected rows into a reusable per-tier F32 scratch, so
+  the proven F32 attention kernels are reused unchanged. The indexed path
+  gathers only the indexer top-k rows back at their original positions, leaving
+  the top-k indices and visible-row bound untouched. `DS4_CUDA_KV_F16=0`
+  restores the F32 cache for A/B debugging. The raw and indexer caches stay F32.
+* **Device scoring and role assignment for heterogeneous multi-GPU.** When
+  several CUDA devices are configured, startup probes PCIe bandwidth, free
+  VRAM, memory bandwidth, FP16 throughput, and SM count, scores each device
+  for prefill/decode/capacity, and orders the device list as primary, expert
+  cache, secondary before the layer packer runs. The plan is logged as TSON.
+  `--force-primary-gpu`, `--force-cache-gpu`, `--disable-multi-gpu`,
+  `--kv-cache-location`, and `--chunk-size` override it. One device (or
+  `--disable-multi-gpu`) degrades to the unchanged single-GPU path.
+* **Three-pane terminal UI and per-token profiler.** In the interactive REPL
+  (on by default on a TTY; `--no-tui` keeps the line editor), the screen is
+  split into chat, a live profiler, and a messages pane. `Tab`/`Shift-Tab`
+  switches the interacted pane; every pane scrolls independently with
+  `PgUp`/`PgDn`. Controls and engine stderr go to messages, never into the
+  assistant text. The profiler has five views: aggregate cost, a compact
+  token/prefill-chunk list, a full per-record detail page, live devices
+  (nvtop-style), and expert residency. Records and events are also served as
+  JSON to the optional browser dashboard (`--dashboard-lan`/`--dashboard-bind`).
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
 * **Host-side expert page-cache budget.** Hot experts stay in the OS page cache
@@ -63,9 +103,12 @@ This fork adds `ds4_cuda_pool_oom_relief()`: when the scratch pool cannot
 allocate, it drops the resident expert pools and the Q8-to-F16/F32 derived
 caches (pure speed caches; correctness never depends on them), keeps the
 resident pool disabled so the next decode does not immediately re-starve the
-pool, and retries once. The model arena's own OOM path now evicts the derived
-caches and retries before falling back, and the from-fd range resolver no
-longer hands a raw host address to a kernel on a full device.
+pool, and retries once. The model arena's own OOM path sheds the rebuildable
+Q8-to-F16/F32 derived caches first and only drops the resident expert pool when
+those were already gone (the document's §7.2 fallback order: the pool is the
+more valuable cache, since a dropped pool re-reads every resident expert on the
+next token while a derived cache rebuilds lazily). The from-fd range resolver
+no longer hands a raw host address to a kernel on a full device.
 
 Verified with a 6-turn server conversation on a 12 GiB RTX 3080 Ti using
 `DS4_CUDA_STREAM_RESIDENT=3`, which previously aborted on the second prompt.
@@ -228,6 +271,26 @@ for API access and multiple sessions.
 The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
 `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
 Run each binary with `--help` for its full options.
+
+On a terminal the REPL uses the three-pane UI (chat, profiler, messages).
+`Tab`/`Shift-Tab` switches panes; each pane scrolls with `PgUp`/`PgDn`. In the
+profiler, `1` overview, `2` tokens/chunks, `3` selected record detail, `4`
+devices, `5` experts; `Up`/`Down` selects, `Enter` opens, `Esc` returns,
+`PgUp`/`PgDn` pages the record list, `u` reloads it, `p` toggles stage capture
+and `r` resets aggregates. The list is frozen while decoding so it cannot slide
+under the reader; new records are counted and appear on `u` or when decoding
+stops. `Ctrl-B` enables breakpoint mode: the engine pauses after each token or
+prefill chunk so the profiler can be inspected; `Space` continues, `b` disables
+and continues, `Ctrl-C` cancels generation. `--no-tui` keeps the classic
+line editor. The profiler is also written as JSONL when
+`DS4_PROFILE_TRACE=/path/to/trace.jsonl` is set.
+
+The UI repaints only the cells that changed, so it stays usable over slow links
+and on software-rendered terminals. `DS4_TUI_FPS=N` caps the frame rate while
+tokens stream (default 10, keys always repaint at once) and
+`DS4_TUI_SYNC=1` wraps frames in synchronized updates (`ESC[?2026h`) for
+terminals that render them correctly; it is off by default because terminals
+that mishandle the sequence show a stray `[?2026h` on screen.
 
 ### Native coding agent
 

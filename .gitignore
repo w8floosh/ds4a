@@ -17,6 +17,10 @@
 /tests/test_engine_mgpu_refusal
 /tests/test_engine_correctness
 /tests/test_gpu_args
+/tests/test_gpu_roles
+/tests/test_gpu_roles_cuda
+/tests/test_profiler
+/tests/test_profiler_tty
 /tests/test_gpu_lookup_cache_strict
 /tests/test_gpu_model_cache
 /tests/test_gpu_xdev
@@ -68,3 +72,9 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/tests/test_cpu_dot
+/tests/test_dashboard_bind
+/tests/test_tui
+/trace.jsonl
+/cufile.log
+/tests/test_prompt_prefix

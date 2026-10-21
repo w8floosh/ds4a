@@ -18013,6 +18013,57 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
                                                              1);
     }
 }
+
+/* The "host expert arena" on Metal is the resident streaming expert cache.
+ * Apple silicon is unified memory: the GPU reads the same pages the CPU does,
+ * so there is no host->device staging copy to remove and a resident expert
+ * already costs no file read. Rather than build a second store, map the
+ * arena's byte budget and seed calls onto that cache and report its residency
+ * and hit/miss counters as the arena, so the engine, profiler and dashboard
+ * see the same tier on both backends. Inert until the engine opts in. */
+static uint64_t g_host_arena_budget_bytes;
+static uint64_t g_host_arena_expert_bytes;
+
+int ds4_gpu_host_arena_configure(uint64_t bytes,
+                                 uint64_t gate_expert_bytes,
+                                 uint64_t down_expert_bytes) {
+    if (bytes == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    if (gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) return 0;
+    const uint64_t per_expert = 2ull * gate_expert_bytes + down_expert_bytes;
+    if (per_expert == 0 || bytes < per_expert) return 0;
+    g_host_arena_budget_bytes = bytes;
+    g_host_arena_expert_bytes = per_expert;
+    return 1;
+}
+
+int ds4_gpu_host_arena_seed(const ds4_gpu_stream_expert_table *table,
+                            const int32_t *expert_ids,
+                            uint32_t n_experts) {
+    if (g_host_arena_budget_bytes == 0) return 0;
+    @autoreleasepool {
+        return ds4_gpu_stream_expert_cache_seed_experts(table, expert_ids,
+                                                        NULL, n_experts);
+    }
+}
+
+void ds4_gpu_host_arena_set_admission(uint32_t threshold) {
+    /* The resident Metal cache runs its own admission policy; nothing to set. */
+    (void)threshold;
+}
+
+void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    const uint32_t resident = g_stream_expert_cache_entry_count;
+    const uint64_t per_expert = g_stream_expert_cache_expert_bytes;
+    out->capacity_bytes = g_host_arena_budget_bytes;
+    out->used_bytes = per_expert ? (uint64_t)resident * per_expert : 0;
+    out->experts = resident;
+    out->hits = g_stream_expert_cache_hits;
+    out->misses = g_stream_expert_cache_misses;
+    /* The resident cache owns its own admission/eviction accounting; it is not
+     * surfaced here, so those counters stay zero on Metal. */
+}
 static uint32_t ds4_gpu_q4_expert_table_group_size(uint32_t n_total_expert) {
     const char *env = getenv("DS4_METAL_Q4_EXPERT_TABLE_GROUP_SIZE");
     if (!env || !env[0]) return 1;

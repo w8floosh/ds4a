@@ -24,6 +24,8 @@
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
 #include "ds4_image.h"
+#include "ds4_gpu_roles.h"
+#include "ds4_profiler.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -128,6 +130,23 @@ static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
+
+/* Compute events for whichever GPU tier the call runs on: the device comes
+ * from the active logical tier, so the same producer works for the primary,
+ * the cache tier, or any future card. */
+struct Ds4ProfComputeScope {
+    uint8_t dev;
+    Ds4ProfComputeScope()
+        : dev((uint8_t)(g_current_logical_tier < 0 ? 0 : g_current_logical_tier)) {
+        if (ds4_profiler_trace_enabled())
+            ds4_profiler_trace_event(DS4_PEV_COMPUTE_START, 0, 0, dev, 0);
+    }
+    ~Ds4ProfComputeScope() {
+        if (ds4_profiler_trace_enabled())
+            ds4_profiler_trace_event(DS4_PEV_COMPUTE_END, 0, 0, dev, 0);
+    }
+};
+
 static int g_ssd_streaming_mode;
 /* Host-side routed-expert cache budget in expert slots (0 = none). When a
  * budget is set, streaming expert loads read through the OS page cache and
@@ -158,96 +177,600 @@ typedef struct {
     int32_t *slot_selected_ptr;
     uint64_t slot_selected_capacity;
     ds4_gpu_tensor slot_selected_tensor;
+    int      aliased;   /* gate/up/down borrow the resident pool; never free */
+    /* Non-aliased tables live in one contiguous slab: gate|up|down. Three
+     * separate cudaMallocs fragment the remaining VRAM, so at 1024-token
+     * prefill the last 672 MiB down table fails even with >1.5 GiB free. */
+    int      slab_owned;
+    /* Fallback when the device slab does not fit: keep as much of gate/up in
+     * VRAM as fits and spill the rest to mapped host memory (zero-copy over
+     * PCIe). Slower, but keeps 1024-token prefill exact and quality-preserving. */
+    int      gate_host_mapped;
+    void    *gate_host_raw;
+    int      up_host_mapped;
+    void    *up_host_raw;
+    int      down_host_mapped;
+    void    *down_host_raw;
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
+
+static void cuda_stream_selected_host_detach(int *mapped, void **raw);
+
+/* Selected experts the engine computes on the CPU for the next load. They are
+ * mapped to a zeroed per-call table slot (index slot_count) so the GPU adds
+ * nothing for them, and the engine adds the CPU result to the routed output
+ * afterwards. Set by ds4_gpu_stream_expert_cache_set_cpu_experts and consumed
+ * by the next begin_load. */
+#define DS4_CUDA_MAX_EXPERT_USED 8u
+static int32_t  g_cpu_expert_ids[DS4_CUDA_MAX_EXPERT_USED];
+static uint32_t g_cpu_expert_count;
+
+extern "C" void ds4_gpu_stream_expert_cache_set_cpu_experts(
+        const int32_t *ids, uint32_t n) {
+    g_cpu_expert_count = 0;
+    if (!ids || n == 0) return;
+    if (n > DS4_CUDA_MAX_EXPERT_USED) n = DS4_CUDA_MAX_EXPERT_USED;
+    for (uint32_t i = 0; i < n; i++) g_cpu_expert_ids[i] = ids[i];
+    g_cpu_expert_count = n;
+}
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
 
 /*
- * Per-layer persistent resident expert pools for streaming decode.
+ * Global resident expert pool for streaming decode, managed with the
+ * Least-Stale policy.
  *
- * Routing is sticky (measured ~40% of re-selections on Flash learned
- * layers), so each layer keeps its most-recently-used experts in a small
- * VRAM pool across tokens. A re-selected expert is copied into the per-call
- * compacted table with a device-to-device copy (a few tens of microseconds)
- * instead of a host read plus PCIe upload. Misses are uploaded into the
- * pool and then D2D-copied into the table, so the pool warms up over time.
- * The pool only serves single-token decode loads (slot_count == 6);
- * batched prefill loads go through the per-call table exactly as before.
+ * MoE expert access is a deterministic front-to-back layer walk, so per-layer
+ * recency is a weak signal: LRU happily evicts an expert from an upcoming
+ * layer that was last touched by the previous token (a "collision miss").
+ * The pool is one global slab of `slots_cap` experts across all layers, and
+ * the victim is chosen to protect experts already used by the current forward
+ * pass (current) while evicting experts last used by an earlier pass (stale)
+ * first, oldest use first. DS4_CUDA_STREAM_RESIDENT_POLICY=lru selects the
+ * pure-recency policy for comparison.
+ *
+ * A re-selected expert is copied into the per-call compacted table with a
+ * device-to-device copy instead of a host read plus PCIe upload; a miss is
+ * uploaded into the table and then D2D-copied into a pool slot. The pool only
+ * serves single-token decode loads (slot_count == 6); batched prefill loads
+ * go through the per-call table exactly as before.
+ *
+ * DS4_CUDA_STREAM_RESIDENT selects the capacity: unset/auto sizes from free
+ * VRAM, 0 disables, N is a total slot count, and NGB/NG is a byte budget.
  */
-#define DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS 128u
+#define DS4_CUDA_EXPERT_POOL_MAX_SLOTS 4096u
+#define DS4_CUDA_EXPERT_POOL_MAX_LAYERS 128u
 
+/*
+ * The pool spans every configured GPU. Slots 0..slots_cap-1 form one global
+ * namespace; slot_base[t]/slot_cap[t] partition it by tier, and slot_tier[]
+ * records where each slot's weights live. The per-call compacted table and
+ * the compute kernels stay on tier 0, so a hit on tier t>0 is served with a
+ * peer copy of that expert's gate/up/down into the table (activation-only
+ * transfer would be the alternative, but weight copy reuses the existing
+ * table path unchanged). Only tier 0 needs to run the model; the other tiers
+ * are pure VRAM expert cache, which is what lets a streaming run use SSD, RAM,
+ * and every GPU at once.
+ */
 typedef struct {
     int      valid;
-    uint32_t layer;
+    int      n_tiers;
+    uint32_t n_layer;
     uint32_t n_total_expert;
-    uint64_t gate_expert_bytes;
+    uint64_t gate_expert_bytes;   /* canonical per-expert size class */
     uint64_t down_expert_bytes;
-    uint32_t slots_cap;              /* resident pool size */
-    uint32_t slots_used;             /* resident experts currently stored */
-    char    *gate_ptr;
-    char    *up_ptr;
-    char    *down_ptr;
-    uint64_t gate_capacity;
-    uint64_t up_capacity;
-    uint64_t down_capacity;
-    int32_t *expert_to_slot;         /* n_total_expert entries, -1 = absent */
-    int32_t *slot_to_expert;         /* slots_cap entries */
-    uint64_t *slot_token;            /* token counter of last use per slot */
-} cuda_layer_resident_experts;
+    uint32_t slots_cap;
+    uint32_t slots_used;
+    int      device[DS4_MAX_GPUS];      /* cuda device id per tier */
+    uint32_t slot_base[DS4_MAX_GPUS];   /* first global slot of tier t */
+    uint32_t slot_cap[DS4_MAX_GPUS];
+    char    *gate_ptr[DS4_MAX_GPUS];
+    char    *up_ptr[DS4_MAX_GPUS];
+    char    *down_ptr[DS4_MAX_GPUS];
+    uint64_t gate_capacity[DS4_MAX_GPUS];
+    uint64_t up_capacity[DS4_MAX_GPUS];
+    uint64_t down_capacity[DS4_MAX_GPUS];
+    int32_t *expert_to_slot;      /* [n_layer * n_total_expert], -1 absent */
+    int32_t *slot_layer;          /* [slots_cap] */
+    int32_t *slot_expert;         /* [slots_cap] */
+    int8_t  *slot_tier;           /* [slots_cap] tier owning the slot */
+    uint64_t *slot_token;         /* decode-call counter of last use */
+    uint64_t *slot_pass;          /* forward-pass index of last use */
+    uint64_t pass;                /* current forward-pass index */
+    int      policy;              /* 0 = LRU, 1 = least-stale */
+    uint64_t stat_lookups;        /* distinct selected experts asked of the pool */
+    uint64_t stat_hits;           /* of those, served from a resident slot */
+} cuda_expert_pool;
 
-static cuda_layer_resident_experts
-    g_layer_resident[DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS];
-static uint64_t g_stream_resident_token;
-static int g_stream_resident_slots_cap = -1;
-static int g_stream_resident_layers_seen;
+static cuda_expert_pool g_expert_pool;
+static int      g_expert_pool_cap = -2;   /* -2 uninit, -1 auto, 0 off, >0 slots */
+static uint64_t g_expert_pool_bytes;      /* explicit byte budget, 0 = unused */
+static int      g_expert_pool_env_read;
+static int      g_expert_pool_auto;       /* env selected auto sizing */
+static int      g_expert_pool_cooldown;   /* dropped by OOM, waiting to re-arm */
+static uint64_t g_expert_pool_tokens;     /* monotonic decode-token counter */
+static uint64_t g_expert_pool_drop_tokens;
 
-static void cuda_layer_resident_release_one(cuda_layer_resident_experts *r) {
-    if (!r) return;
-    if (r->gate_ptr) (void)cudaFree(r->gate_ptr);
-    if (r->up_ptr) (void)cudaFree(r->up_ptr);
-    if (r->down_ptr) (void)cudaFree(r->down_ptr);
-    free(r->expert_to_slot);
-    free(r->slot_to_expert);
-    free(r->slot_token);
-    memset(r, 0, sizeof(*r));
+static void cuda_expert_pool_release(void) {
+    cuda_expert_pool *p = &g_expert_pool;
+    /* §9.1: report the Least-Stale hit rate while the pool is still live.
+     * Printed at shutdown and whenever the pool self-disables under VRAM
+     * pressure, which is exactly when the number is worth knowing. */
+    if (p->valid && p->stat_lookups != 0) {
+        fprintf(stderr,
+                "ds4: CUDA expert pool hit rate %.1f%% (%llu/%llu decode lookups)\n",
+                100.0 * (double)p->stat_hits / (double)p->stat_lookups,
+                (unsigned long long)p->stat_hits,
+                (unsigned long long)p->stat_lookups);
+    }
+    /* If the selected cache borrowed these slabs (in-place expert fast path),
+     * invalidate it before the memory goes away so the next load rebuilds
+     * instead of reading freed pool slots. */
+    if (g_stream_selected_cache.aliased) cuda_stream_selected_cache_invalidate();
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (!p->gate_ptr[t] && !p->up_ptr[t] && !p->down_ptr[t]) continue;
+        if (cudaSetDevice(p->device[t]) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        if (p->gate_ptr[t]) (void)cudaFree(p->gate_ptr[t]);
+        if (p->up_ptr[t]) (void)cudaFree(p->up_ptr[t]);
+        if (p->down_ptr[t]) (void)cudaFree(p->down_ptr[t]);
+    }
+    (void)cudaSetDevice(0);
+    free(p->expert_to_slot);
+    free(p->slot_layer);
+    free(p->slot_expert);
+    free(p->slot_tier);
+    free(p->slot_token);
+    free(p->slot_pass);
+    memset(p, 0, sizeof(*p));
 }
 
-static void cuda_layer_resident_release_all(void) {
-    for (uint32_t i = 0; i < DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS; i++) {
-        cuda_layer_resident_release_one(&g_layer_resident[i]);
+/* Number of decode tokens to wait before re-arming an auto pool that was
+ * dropped for VRAM. Long enough that the lazy weight arena has settled, short
+ * enough that a long session recovers its resident experts. */
+#define DS4_EXPERT_POOL_REARM_TOKENS 1024u
+#define DS4_EXPERT_POOL_REARM_FREE   (2ull << 30)
+
+/* Drop the pool under VRAM pressure. An auto-sized pool re-arms later when
+ * VRAM is free again (the model arena loads lazily, so the pressure at drop
+ * time may be transient); an explicitly sized pool stays off because the
+ * caller asked for a count that no longer fits. */
+static void cuda_expert_pool_drop(void) {
+    const uint64_t tokens = g_expert_pool_tokens;
+    cuda_expert_pool_release();
+    if (g_expert_pool_auto) {
+        g_expert_pool_cooldown = 1;
+        g_expert_pool_drop_tokens = tokens;
+    } else {
+        g_expert_pool_cap = 0;
     }
 }
 
-static uint32_t cuda_stream_resident_cap(uint32_t layer, uint64_t per_expert_bytes) {
-    if (g_stream_resident_slots_cap < 0) {
-        /* Off unless explicitly requested: the pool must share VRAM with
-         * the non-routed model, KV, and decode scratch, and there is no
-         * reliable way to know the model's VRAM footprint at this point.
-         * Machines with real headroom can opt in with
-         * DS4_CUDA_STREAM_RESIDENT=4..6. */
-        int cap = 0;
-        const char *env = getenv("DS4_CUDA_STREAM_RESIDENT");
-        if (env && env[0]) {
+/* Total VRAM currently held by the pool across every tier. */
+static uint64_t cuda_expert_pool_bytes(void) {
+    const cuda_expert_pool *p = &g_expert_pool;
+    uint64_t b = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        b += p->gate_capacity[t] + p->up_capacity[t] + p->down_capacity[t];
+    }
+    return b;
+}
+
+static void cuda_expert_pool_env_read_once(void) {
+    if (g_expert_pool_env_read) return;
+    g_expert_pool_env_read = 1;
+
+    const char *policy = getenv("DS4_CUDA_STREAM_RESIDENT_POLICY");
+    g_expert_pool.policy =
+        (policy && (!strcmp(policy, "lru") || !strcmp(policy, "0"))) ? 0 : 1;
+
+    /* Auto is the default but only ever sizes from free VRAM at decode, once
+     * the model arena has settled, so it can never starve the non-routed
+     * weights. An explicit slot/byte count instead reserves VRAM up front and
+     * therefore also seeds the hotlist before the first token. */
+    const char *env = getenv("DS4_CUDA_STREAM_RESIDENT");
+    g_expert_pool_cap = -1;
+    if (env && env[0]) {
+        if (!strcmp(env, "0")) {
+            g_expert_pool_cap = 0;
+        } else if (!strcasecmp(env, "auto")) {
+            g_expert_pool_cap = -1;
+        } else {
             char *end = NULL;
-            long v = strtol(env, &end, 10);
-            if (end != env && v >= 0 && v <= 6) cap = (int)v;
-        }
-        g_stream_resident_slots_cap = cap;
-        if (g_stream_resident_slots_cap > 0) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming resident expert pool: %d slots per layer "
-                    "(%.2f GiB VRAM)\n",
-                    g_stream_resident_slots_cap,
-                    (double)((uint64_t)g_stream_resident_slots_cap *
-                             per_expert_bytes * 64) / 1073741824.0);
+            unsigned long long v = strtoull(env, &end, 10);
+            const int gib = end && (*end == 'G' || *end == 'g') &&
+                            (end[1] == '\0' || !strcasecmp(end + 1, "ib"));
+            if (end == env) {
+                g_expert_pool_cap = 0;
+            } else if (gib) {
+                g_expert_pool_bytes = v << 30;
+                g_expert_pool_cap = -1;
+            } else {
+                g_expert_pool_cap = v > DS4_CUDA_EXPERT_POOL_MAX_SLOTS
+                    ? (int)DS4_CUDA_EXPERT_POOL_MAX_SLOTS : (int)v;
+            }
         }
     }
-    (void)layer;
-    return (uint32_t)g_stream_resident_slots_cap;
+    /* Auto only when no explicit slot count or byte budget was requested. */
+    g_expert_pool_auto = (g_expert_pool_cap < 0 && g_expert_pool_bytes == 0);
+}
+
+static uint32_t cuda_expert_pool_auto_cap(uint64_t per_expert_bytes) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (per_expert_bytes == 0 ||
+        cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* Keep a floor reserve for KV/scratch growth, capped so a large card
+     * does not give the pool an unbounded share. Then use at most 3/4 of
+     * what remains: the pool is a speed cache, never a correctness need. */
+    uint64_t reserve = (uint64_t)free_bytes / 8u;
+    if (reserve < (64ull << 20)) reserve = 64ull << 20;
+    if (reserve > (768ull << 20)) reserve = 768ull << 20;
+    uint64_t budget = free_bytes > reserve ? (uint64_t)free_bytes - reserve : 0;
+    budget -= budget / 10u;
+    uint64_t slots = budget / per_expert_bytes;
+    if (slots > DS4_CUDA_EXPERT_POOL_MAX_SLOTS) {
+        slots = DS4_CUDA_EXPERT_POOL_MAX_SLOTS;
+    }
+    return (uint32_t)slots;
+}
+
+/* Capacity the pool would use for this size class, without allocating. The
+ * engine's hotlist preload sizing needs this before the pool exists. */
+static uint32_t cuda_expert_pool_choose_cap(uint64_t per_expert_bytes) {
+    cuda_expert_pool_env_read_once();
+    if (g_expert_pool_cap == 0 || per_expert_bytes == 0) return 0;
+    uint32_t cap;
+    if (g_expert_pool_bytes != 0) {
+        cap = (uint32_t)(g_expert_pool_bytes / per_expert_bytes);
+    } else if (g_expert_pool_cap >= 0) {
+        cap = (uint32_t)g_expert_pool_cap;
+    } else {
+        cap = cuda_expert_pool_auto_cap(per_expert_bytes);
+    }
+    if (cap > DS4_CUDA_EXPERT_POOL_MAX_SLOTS) cap = DS4_CUDA_EXPERT_POOL_MAX_SLOTS;
+    return cap;
+}
+
+/*
+ * Ensure the pool matches this expert size class. Mixed-precision GGUFs can
+ * size a few layers differently; those layers fall back to direct reads.
+ * Returns 1 when the pool is usable for the given class, 0 otherwise.
+ */
+/* Number of expert-cache tiers: the primary plus, in streaming mode, every
+ * other configured device that has a validated peer path to the primary. */
+static int cuda_expert_pool_tier_count(void) {
+    int tiers = 1;
+    if (g_ssd_streaming_mode && g_n_gpus > 1) {
+        tiers = g_n_gpus < DS4_MAX_GPUS ? g_n_gpus : DS4_MAX_GPUS;
+    }
+    return tiers;
+}
+
+/* Allocate this tier's slab, halving the requested slot count until it fits.
+ * On success records the capacities and returns the granted slot count (0 on
+ * failure). gate/up/down pointers are left set only on success. */
+static uint32_t cuda_expert_pool_alloc_tier(cuda_expert_pool *p, int t,
+                                            uint32_t want,
+                                            uint64_t gate_bytes,
+                                            uint64_t down_bytes) {
+    for (uint32_t cap = want; cap >= 1u; cap /= 2u) {
+        uint64_t gate_slab = (uint64_t)cap * gate_bytes;
+        uint64_t down_slab = (uint64_t)cap * down_bytes;
+        void *g = NULL, *u = NULL, *d = NULL;
+        if (cudaMalloc(&g, (size_t)gate_slab) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        if (cudaMalloc(&u, (size_t)gate_slab) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(g);
+            continue;
+        }
+        if (cudaMalloc(&d, (size_t)down_slab) != cudaSuccess) {
+            (void)cudaGetLastError();
+            (void)cudaFree(g);
+            (void)cudaFree(u);
+            continue;
+        }
+        p->gate_ptr[t] = (char *)g;
+        p->up_ptr[t] = (char *)u;
+        p->down_ptr[t] = (char *)d;
+        p->gate_capacity[t] = gate_slab;
+        p->up_capacity[t] = gate_slab;
+        p->down_capacity[t] = down_slab;
+        return cap;
+    }
+    return 0;
+}
+
+static int cuda_expert_pool_ensure(uint32_t n_total_expert,
+                                   uint64_t gate_bytes,
+                                   uint64_t down_bytes,
+                                   int allow_alloc) {
+    cuda_expert_pool *p = &g_expert_pool;
+    if (p->valid) {
+        return p->n_total_expert == n_total_expert &&
+               p->gate_expert_bytes == gate_bytes &&
+               p->down_expert_bytes == down_bytes;
+    }
+    if (!allow_alloc) return 0;
+    cuda_expert_pool_env_read_once();
+    if (g_expert_pool_cooldown) {
+        /* The pool was dropped for VRAM. Only try again once the arena has had
+         * time to settle and there is real headroom, so we do not thrash on
+         * every decode token. */
+        if (g_expert_pool_tokens <
+            g_expert_pool_drop_tokens + DS4_EXPERT_POOL_REARM_TOKENS) {
+            return 0;
+        }
+        uint64_t free_bytes = 0, total_bytes = 0;
+        (void)cudaSetDevice(0);
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+            free_bytes < DS4_EXPERT_POOL_REARM_FREE) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_expert_pool_cooldown = 0;
+    }
+    if (g_expert_pool_cap == 0 || n_total_expert == 0 ||
+        gate_bytes == 0 || down_bytes == 0 ||
+        gate_bytes > UINT64_MAX / 2u) {
+        return 0;
+    }
+    const uint64_t per_expert = gate_bytes * 2u + down_bytes;
+    const uint32_t key_count = DS4_CUDA_EXPERT_POOL_MAX_LAYERS * n_total_expert;
+    const int want_tiers = cuda_expert_pool_tier_count();
+    /* Count tiers that pass the peer check so an explicit budget or slot count
+     * is split across them instead of each tier claiming the whole request
+     * (which would multiply an N GB budget by the GPU count). */
+    /* The primary stays dense-only in streaming when another tier can host the
+     * pool: its VRAM is committed to the resident non-routed weights, so the
+     * GPU-side routed-expert pool lives only on the other tiers (the 3060 bank
+     * holds the hot routed set, and the host page cache serves the rest).
+     *
+     * Another tier can host the pool only with a validated peer path. On a
+     * no-P2P board (this box) the check below skips every other tier, so the
+     * primary's idle VRAM is the only place the pool can live; fall back to it
+     * rather than leaving the bank memory unusable. The allocation below keeps
+     * a prefill-sized slice of the primary free. DS4_CUDA_NO_POOL_PRIMARY opts
+     * out. */
+    int peer_tier_usable = 0;
+    for (int t = 1; t < want_tiers; t++) {
+        if (g_gpu_peer_ok[t][0]) { peer_tier_usable = 1; break; }
+    }
+    const int skip_primary = (g_ssd_streaming_mode && g_n_gpus > 1 &&
+                              (peer_tier_usable ||
+                               getenv("DS4_CUDA_NO_POOL_PRIMARY") != NULL));
+    int n_usable = 0;
+    for (int t = 0; t < want_tiers; t++) {
+        if (skip_primary && t == 0) continue;
+        if (t > 0 && !g_gpu_peer_ok[t][0]) continue;
+        n_usable++;
+    }
+    if (n_usable < 1) n_usable = 1;
+
+    uint32_t cap_per_tier[DS4_MAX_GPUS] = {0};
+    int      n_tiers = 0;
+    uint32_t total_cap = 0;
+    for (int t = 0; t < want_tiers; t++) {
+        const int dev = t < g_n_gpus ? g_gpu[t].device_id : t;
+        if (skip_primary && t == 0) continue;
+        /* Tiers past the primary must reach it over a validated peer path;
+         * there is no host-bounce fallback in the hot decode loop. */
+        if (t > 0 && !g_gpu_peer_ok[t][0]) continue;
+        if (cudaSetDevice(dev) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        uint32_t want;
+        if (g_expert_pool_bytes != 0) {
+            want = (uint32_t)((g_expert_pool_bytes / (uint64_t)n_usable) /
+                              per_expert);
+        } else if (g_expert_pool_cap > 0) {
+            want = (uint32_t)g_expert_pool_cap / (uint32_t)n_usable;
+            if (want == 0) want = 1;
+        } else {
+            want = cuda_expert_pool_auto_cap(per_expert);
+            /* Falling back to the primary (no peer tier to host the pool):
+             * keep a prefill-sized slice free so the transient prefill
+             * activation buffers still fit. auto_cap's own reserve (<=768 MiB)
+             * is sized for a pure cache tier, not the compute device. */
+            if (t == 0 && !skip_primary) {
+                size_t f = 0, tot = 0;
+                if (cudaMemGetInfo(&f, &tot) == cudaSuccess) {
+                    const uint64_t keep = 1024ull << 20;
+                    const uint64_t room = f > keep ? (uint64_t)f - keep : 0;
+                    const uint64_t slots = per_expert ? room / per_expert : 0;
+                    if (slots < want) want = (uint32_t)slots;
+                } else {
+                    (void)cudaGetLastError();
+                }
+            }
+        }
+        const uint32_t got =
+            cuda_expert_pool_alloc_tier(p, t, want, gate_bytes, down_bytes);
+        if (got == 0) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        p->device[t] = dev;
+        cap_per_tier[t] = got;
+        total_cap += got;
+        n_tiers = t + 1;
+    }
+    if (total_cap == 0) {
+        size_t free_b = 0, total_b = 0;
+        (void)cudaSetDevice(0);
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        if (g_expert_pool_cap < 0) {
+            fprintf(stderr,
+                    "ds4: CUDA expert pool: no spare VRAM (free %.2f GiB); "
+                    "routed experts stream per token\n",
+                    (double)free_b / 1073741824.0);
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA expert pool allocation failed (free %.2f GiB, "
+                    "%.2f MiB/slot); routed experts stream per token\n",
+                    (double)free_b / 1073741824.0, (double)per_expert / 1048576.0);
+        }
+        (void)cudaGetLastError();
+        g_expert_pool_cap = 0;
+        return 0;
+    }
+
+    p->expert_to_slot = (int32_t *)malloc((size_t)key_count * sizeof(int32_t));
+    p->slot_layer = (int32_t *)malloc((size_t)total_cap * sizeof(int32_t));
+    p->slot_expert = (int32_t *)malloc((size_t)total_cap * sizeof(int32_t));
+    p->slot_tier = (int8_t *)malloc((size_t)total_cap * sizeof(int8_t));
+    p->slot_token = (uint64_t *)malloc((size_t)total_cap * sizeof(uint64_t));
+    p->slot_pass = (uint64_t *)malloc((size_t)total_cap * sizeof(uint64_t));
+    if (!p->expert_to_slot || !p->slot_layer || !p->slot_expert ||
+        !p->slot_tier || !p->slot_token || !p->slot_pass) {
+        cuda_expert_pool_release();
+        return 0;
+    }
+    for (uint32_t i = 0; i < key_count; i++) p->expert_to_slot[i] = -1;
+    uint32_t base = 0;
+    for (int t = 0; t < n_tiers; t++) {
+        p->slot_base[t] = base;
+        p->slot_cap[t] = cap_per_tier[t];
+        for (uint32_t s = 0; s < cap_per_tier[t]; s++) {
+            p->slot_layer[base + s] = -1;
+            p->slot_expert[base + s] = -1;
+            p->slot_tier[base + s] = (int8_t)t;
+            p->slot_token[base + s] = 0;
+            p->slot_pass[base + s] = 0;
+        }
+        base += cap_per_tier[t];
+    }
+    p->n_layer = DS4_CUDA_EXPERT_POOL_MAX_LAYERS;
+    p->n_total_expert = n_total_expert;
+    p->gate_expert_bytes = gate_bytes;
+    p->down_expert_bytes = down_bytes;
+    p->slots_cap = total_cap;
+    p->slots_used = 0;
+    p->n_tiers = n_tiers;
+    p->pass = 0;
+    p->valid = 1;
+
+    if (n_tiers > 1) {
+        fprintf(stderr,
+                "ds4: CUDA expert pool: %u slots across %d GPUs (tiers",
+                total_cap, n_tiers);
+        for (int t = 0; t < n_tiers; t++) {
+            fprintf(stderr, " %d:%u", p->device[t], cap_per_tier[t]);
+        }
+        fprintf(stderr, ", %.2f GiB VRAM, %s)\n",
+                (double)((uint64_t)total_cap * per_expert) / 1073741824.0,
+                p->policy ? "least-stale" : "lru");
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA expert pool: %u slots (%.2f GiB VRAM, %s, "
+                "%s size class)\n",
+                total_cap,
+                (double)((uint64_t)total_cap * per_expert) / 1073741824.0,
+                p->policy ? "least-stale" : "lru",
+                g_expert_pool_bytes != 0 ? "byte budget" :
+                (g_expert_pool_cap >= 0 ? "explicit" : "auto from free VRAM"));
+    }
+    (void)cudaSetDevice(0);
+    return 1;
+}
+
+static int32_t cuda_expert_pool_lookup(uint32_t layer, uint32_t expert) {
+    cuda_expert_pool *p = &g_expert_pool;
+    if (!p->valid || layer >= p->n_layer || expert >= p->n_total_expert) return -1;
+    return p->expert_to_slot[(size_t)layer * p->n_total_expert + expert];
+}
+
+static void cuda_expert_pool_touch(int32_t slot) {
+    cuda_expert_pool *p = &g_expert_pool;
+    if (!p->valid || slot < 0 || (uint32_t)slot >= p->slots_used) return;
+    p->slot_token[slot] = p->pass;
+    p->slot_pass[slot] = p->pass;
+}
+
+/* Least-Stale victim: protect experts already used this pass, evict stale
+ * experts from earlier passes first, oldest use first; prefer stale experts
+ * in layers already walked this pass over stale experts still ahead, which
+ * are about to be demanded again. LRU reduces to pure oldest-use. */
+static int32_t cuda_expert_pool_pick_victim(uint32_t cur_layer) {
+    cuda_expert_pool *p = &g_expert_pool;
+    int32_t best = -1;
+    int best_score = -1;
+    uint64_t best_token = 0;
+    for (uint32_t s = 0; s < p->slots_used; s++) {
+        int score = 0;
+        if (p->policy == 1) {
+            const int stale = p->slot_pass[s] < p->pass;
+            const int walked = p->slot_layer[s] < (int32_t)cur_layer;
+            score = stale ? (walked ? 3 : 2) : (walked ? 1 : 0);
+        }
+        if (score > best_score ||
+            (score == best_score &&
+             (best < 0 || p->slot_token[s] < best_token))) {
+            best = (int32_t)s;
+            best_score = score;
+            best_token = p->slot_token[s];
+        }
+    }
+    return best;
+}
+
+/* Reserve a slot for (layer,expert) and record it. fill_only never evicts a
+ * resident expert, so lower-priority hotlist seeds cannot displace the seed. */
+static int32_t cuda_expert_pool_admit(uint32_t layer, uint32_t expert,
+                                      uint32_t cur_layer, int fill_only) {
+    cuda_expert_pool *p = &g_expert_pool;
+    if (!p->valid || layer >= p->n_layer || expert >= p->n_total_expert) return -1;
+    const size_t key = (size_t)layer * p->n_total_expert + expert;
+    if (p->expert_to_slot[key] >= 0) return p->expert_to_slot[key];
+    int32_t slot;
+    if (p->slots_used < p->slots_cap) {
+        slot = (int32_t)p->slots_used++;
+    } else if (fill_only) {
+        return -1;
+    } else {
+        slot = cuda_expert_pool_pick_victim(cur_layer);
+        if (slot < 0) return -1;
+        const size_t old_key =
+            (size_t)p->slot_layer[slot] * p->n_total_expert + p->slot_expert[slot];
+        if (old_key < (size_t)p->n_layer * p->n_total_expert) {
+            p->expert_to_slot[old_key] = -1;
+        }
+    }
+    p->slot_layer[slot] = (int32_t)layer;
+    p->slot_expert[slot] = (int32_t)expert;
+    p->slot_token[slot] = p->pass;
+    p->slot_pass[slot] = p->pass;
+    p->expert_to_slot[key] = slot;
+    return slot;
+}
+
+/* Forward declaration: loads the stashed hotlist once the pool exists. */
+static void cuda_expert_pool_flush_stash(void);
+
+/* Undo an admission whose weight load failed, so a half-filled slot is not
+ * mistaken for a resident expert. */
+static void cuda_expert_pool_forget(uint32_t layer, uint32_t expert,
+                                    int32_t slot) {
+    cuda_expert_pool *p = &g_expert_pool;
+    if (!p->valid || layer >= p->n_layer || expert >= p->n_total_expert) return;
+    p->expert_to_slot[(size_t)layer * p->n_total_expert + expert] = -1;
+    if (slot >= 0 && (uint32_t)slot < p->slots_used &&
+        p->slot_layer[slot] == (int32_t)layer &&
+        p->slot_expert[slot] == (int32_t)expert) {
+        p->slot_layer[slot] = -1;
+        p->slot_expert[slot] = -1;
+    }
 }
 
 /*
@@ -270,6 +793,15 @@ typedef struct {
     char    *dst;
     uint64_t dst_off;
     int      ok;
+    /* Set when the bytes already live in the pinned host expert arena: the
+     * worker then skips the file read and publishes this pointer instead, so
+     * the upload is a single H2D DMA with no staging copy and no page-cache
+     * traffic. */
+    const char *arena;
+    /* Set when this read should also file the bytes in the arena on the way
+     * through: the worker copies the staging payload into the pinned arena
+     * slot, so admission costs a parallel copy and nothing else. */
+    char    *admit_to;
 } cuda_pread_job;
 
 typedef struct {
@@ -311,10 +843,22 @@ static void *cuda_pread_pool_worker(void *arg) {
         pthread_mutex_unlock(&pool->mutex);
 
         cuda_pread_job *job = &pool->jobs[idx];
-        job->payload = NULL;
-        job->ok = cuda_model_stage_read(job->stage, job->stage_capacity,
-                                        job->offset, job->bytes,
-                                        &job->payload, job->use_page_cache);
+        if (job->arena) {
+            /* Resident in the host arena: no file read, no page-cache touch. */
+            job->payload = job->arena;
+            job->ok = 1;
+        } else {
+            job->payload = NULL;
+            job->ok = cuda_model_stage_read(job->stage, job->stage_capacity,
+                                            job->offset, job->bytes,
+                                            &job->payload, job->use_page_cache);
+            /* File a qualifying miss in the arena on the way through, so the
+             * next fetch of this expert is a hit. A parallel copy in the read
+             * thread, never a second read and never a device round trip. */
+            if (job->ok && job->admit_to) {
+                memcpy(job->admit_to, job->payload, (size_t)job->bytes);
+            }
+        }
 
         pthread_mutex_lock(&pool->mutex);
         pool->jobs_done++;
@@ -342,10 +886,37 @@ static void cuda_pread_pool_ensure_started(void) {
 }
 
 /* Run n parallel preads; returns 0 on any read failure. */
+/* Cumulative bytes pulled through the storage read path (SSD or its page
+ * cache). Declared before the pread pool so the completion path can charge
+ * it; exposed through ds4_gpu_profiler_stats as the SSD row's throughput. */
+static uint64_t g_prof_ssd_read_bytes;
+
+/* Per-phase wall time, accumulated so the per-token numbers add up:
+ *   per token = host_read + host_other + device_upload + device_readback
+ *               + device_sync
+ * Every term is measured elapsed time on the calling thread, so the parts sum
+ * exactly instead of overlapping. device_wait is the total of the three device
+ * terms and is kept for the host/device split. Cost: two clock reads per
+ * blocked call, which is noise next to the calls themselves. */
+static uint64_t g_prof_device_wait_ns;   /* all blocking device waits */
+static uint64_t g_prof_upload_wait_ns;   /* part: expert upload stream sync */
+static uint64_t g_prof_readback_ns;      /* part: blocking D2H tensor reads */
+static uint64_t g_prof_host_read_ns;     /* CPU blocked in the host read pool */
+static inline uint64_t prof_now_ns(void) {
+#if !defined(_WIN32)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+
 static int cuda_pread_pool_run(cuda_pread_job *jobs, int n) {
     if (n <= 0) return 1;
     cuda_pread_pool_ensure_started();
     cuda_pread_pool *pool = &g_cuda_pread_pool;
+    const uint64_t read_t0 = prof_now_ns();
     pthread_mutex_lock(&pool->mutex);
     pool->jobs = jobs;
     pool->next_job = 0;
@@ -357,6 +928,26 @@ static int cuda_pread_pool_run(cuda_pread_job *jobs, int n) {
     }
     pool->jobs = NULL;
     pthread_mutex_unlock(&pool->mutex);
+    const uint64_t read_dt = prof_now_ns() - read_t0;
+    g_prof_host_read_ns += read_dt;
+    ds4_profiler_note_step(DS4_PSTEP_HOST_MOE_PREP, read_dt, 1, 0);
+    uint64_t ssd_bytes = 0, arena_bytes = 0, ssd_jobs = 0, arena_jobs = 0;
+    for (int i = 0; i < n; i++) {
+        /* Arena jobs never touched storage, so they must not be charged to
+         * the SSD read counter. */
+        if (jobs[i].ok && !jobs[i].arena) {
+            g_prof_ssd_read_bytes += jobs[i].bytes;
+            ssd_bytes += jobs[i].bytes;
+            ssd_jobs++;
+        } else if (jobs[i].ok) {
+            arena_bytes += jobs[i].bytes;
+            arena_jobs++;
+        }
+    }
+    if (ssd_jobs)
+        ds4_profiler_note_step(DS4_PSTEP_XFER_EXPERT_SSD, read_dt, ssd_jobs, ssd_bytes);
+    if (arena_jobs)
+        ds4_profiler_note_step(DS4_PSTEP_XFER_EXPERT_ARENA, 0, arena_jobs, arena_bytes);
     for (int i = 0; i < n; i++) {
         if (!jobs[i].ok) return 0;
     }
@@ -368,15 +959,37 @@ static void cuda_stream_selected_cache_release(void) {
     if (tier >= 0 && tier < g_n_gpus) {
         (void)ds4_gpu_set_current_device(tier);
     }
-    if (g_stream_selected_cache.gate_ptr) {
-        (void)cudaFree(g_stream_selected_cache.gate_ptr);
+    /* In the in-place fast path the weight pointers borrow the resident pool;
+     * freeing them here would corrupt the pool. Only the slot-id buffer is
+     * owned by the cache then. */
+    if (!g_stream_selected_cache.aliased) {
+        if (g_stream_selected_cache.slab_owned) {
+            /* One device base covers gate/up (down may be the host alias). */
+            if (!g_stream_selected_cache.gate_host_mapped &&
+                g_stream_selected_cache.gate_ptr) {
+                (void)cudaFree(g_stream_selected_cache.gate_ptr);
+            }
+        } else {
+            if (!g_stream_selected_cache.gate_host_mapped &&
+                g_stream_selected_cache.gate_ptr) {
+                (void)cudaFree(g_stream_selected_cache.gate_ptr);
+            }
+            if (!g_stream_selected_cache.up_host_mapped &&
+                g_stream_selected_cache.up_ptr) {
+                (void)cudaFree(g_stream_selected_cache.up_ptr);
+            }
+            if (!g_stream_selected_cache.down_host_mapped &&
+                g_stream_selected_cache.down_ptr) {
+                (void)cudaFree(g_stream_selected_cache.down_ptr);
+            }
+        }
     }
-    if (g_stream_selected_cache.up_ptr) {
-        (void)cudaFree(g_stream_selected_cache.up_ptr);
-    }
-    if (g_stream_selected_cache.down_ptr) {
-        (void)cudaFree(g_stream_selected_cache.down_ptr);
-    }
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.gate_host_mapped,
+                                     &g_stream_selected_cache.gate_host_raw);
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.up_host_mapped,
+                                     &g_stream_selected_cache.up_host_raw);
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.down_host_mapped,
+                                     &g_stream_selected_cache.down_host_raw);
     if (g_stream_selected_cache.slot_selected_ptr) {
         (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
     }
@@ -439,6 +1052,131 @@ ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static bool g_device_is_spark = false;
+
+/* Terminal profiler byte counters (see ds4_profiler.c). Cumulative bytes that
+ * crossed PCIe into (tx) or out of (rx) each tier. Written by the engine
+ * thread, read by the 25 ms profiler thread; 64-bit aligned writes are
+ * effectively atomic on the supported hosts and the display tolerates a
+ * one-tick stale value. */
+static uint64_t g_prof_tx[DS4_MAX_GPUS];
+static uint64_t g_prof_rx[DS4_MAX_GPUS];
+static inline void prof_note_tx(int tier, uint64_t bytes) {
+    if (tier >= 0 && tier < DS4_MAX_GPUS) g_prof_tx[tier] += bytes;
+}
+static inline void prof_note_rx(int tier, uint64_t bytes) {
+    if (tier >= 0 && tier < DS4_MAX_GPUS) g_prof_rx[tier] += bytes;
+}
+/* Transfer accounting split by what moved: weight/expert data loaded into a
+ * tier, versus activation traffic (cross-device handoffs, host tensor
+ * read/write). The engine diffs these per token to attribute decode time to the
+ * PCIe link versus compute. */
+static uint64_t g_prof_weight_bytes[DS4_MAX_GPUS];
+static uint64_t g_prof_activation_bytes[DS4_MAX_GPUS];
+static inline void prof_note_weight(int tier, uint64_t bytes) {
+    if (tier >= 0 && tier < DS4_MAX_GPUS) g_prof_weight_bytes[tier] += bytes;
+}
+static inline void prof_note_activation(int tier, uint64_t bytes) {
+    if (tier >= 0 && tier < DS4_MAX_GPUS) g_prof_activation_bytes[tier] += bytes;
+}
+
+/* One-time measured PCIe peak per tier (the profiler bar denominator) and the
+ * routed-expert quantization label set by the engine. */
+static uint64_t g_prof_pcie_max_bps[DS4_MAX_GPUS];
+static char     g_prof_expert_type[DS4_PROFILER_TYPE_LEN];
+
+/* Experts actually read into host RAM (the page cache), tracked by a bitmap so
+ * the RAM row shows residency rather than the configured ceiling. Only counts
+ * when the host expert cache is enabled (otherwise reads bypass the cache). */
+static uint8_t *g_host_expert_seen;
+static uint64_t g_host_expert_seen_cap;
+static uint32_t g_host_expert_seen_ne;
+static uint64_t g_host_experts_resident;
+static uint64_t g_stream_expert_bytes;
+
+static void cuda_host_expert_mark(uint32_t layer, uint32_t expert,
+                                  uint32_t n_total_expert) {
+    if (g_stream_keep_expert_cache == 0 || n_total_expert == 0) return;
+    if (!g_host_expert_seen || g_host_expert_seen_ne != n_total_expert) {
+        free(g_host_expert_seen);
+        g_host_expert_seen_cap =
+            (uint64_t)DS4_CUDA_EXPERT_POOL_MAX_LAYERS * n_total_expert;
+        g_host_expert_seen = (uint8_t *)calloc((size_t)g_host_expert_seen_cap, 1);
+        g_host_expert_seen_ne = n_total_expert;
+        g_host_experts_resident = 0;
+        if (!g_host_expert_seen) return;
+    }
+    const uint64_t key = (uint64_t)layer * n_total_expert + expert;
+    if (layer >= DS4_CUDA_EXPERT_POOL_MAX_LAYERS || key >= g_host_expert_seen_cap) return;
+    if (!g_host_expert_seen[key]) {
+        g_host_expert_seen[key] = 1;
+        g_host_experts_resident++;
+    }
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_type_name(const char *name) {
+    if (!name) name = "";
+    snprintf(g_prof_expert_type, sizeof(g_prof_expert_type), "%s", name);
+}
+
+/* Engine-owned per-device residency the backend cannot derive on its own: the
+ * selective-cache slab holding the dense/non-routed set on the compute tier and
+ * the startup hot-expert bank on a cache tier. Both are installed once and
+ * computed in place, so every byte is genuinely resident. Without this push the
+ * panel reads both tiers as empty and parks the slabs under "other". */
+typedef struct {
+    uint64_t dense;    /* dense/non-routed slab bytes */
+    uint32_t entries;  /* resident (layer, expert) slots */
+    uint64_t expert;   /* routed-expert bank slab bytes */
+} cuda_prof_resident;
+static cuda_prof_resident g_prof_resident[DS4_MAX_GPUS];
+
+extern "C" void ds4_gpu_profiler_set_device_resident(int device_id,
+                                                     uint64_t dense_bytes,
+                                                     uint32_t expert_entries,
+                                                     uint64_t expert_bytes) {
+    if (device_id < 0 || device_id >= DS4_MAX_GPUS) return;
+    g_prof_resident[device_id].dense = dense_bytes;
+    g_prof_resident[device_id].entries = expert_entries;
+    g_prof_resident[device_id].expert = expert_bytes;
+}
+
+/* Cheap counters for the engine's per-token timing; no device state touched. */
+extern "C" int ds4_gpu_transfer_snapshot(ds4_gpu_transfer *out, int max_tiers) {
+    if (!out || max_tiers <= 0) return 0;
+    const int n = g_n_gpus > 0 ? g_n_gpus : 1;
+    int k = 0;
+    for (int t = 0; t < n && k < max_tiers; t++, k++) {
+        out[k].weight_into = g_prof_weight_bytes[t];
+        out[k].activation_io = g_prof_activation_bytes[t];
+    }
+    return k;
+}
+
+extern "C" uint64_t ds4_gpu_pcie_peak_bps(int tier) {
+    return (tier >= 0 && tier < DS4_MAX_GPUS) ? g_prof_pcie_max_bps[tier] : 0;
+}
+
+extern "C" void ds4_gpu_phase_snapshot(ds4_gpu_phases *out) {
+    if (!out) return;
+    out->device_wait_ns = g_prof_device_wait_ns;
+    out->upload_wait_ns = g_prof_upload_wait_ns;
+    out->readback_ns = g_prof_readback_ns;
+    out->host_read_ns = g_prof_host_read_ns;
+}
+
+extern "C" void ds4_gpu_machine_snapshot(ds4_gpu_machine *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    const int n = g_n_gpus > 0 ? g_n_gpus : 1;
+    out->tiers = n < DS4_PROF_MACHINE_TIERS ? n : DS4_PROF_MACHINE_TIERS;
+    out->ssd_read_bytes = g_prof_ssd_read_bytes;
+    for (int t = 0; t < out->tiers; t++) {
+        out->tx_bytes[t] = g_prof_tx[t];
+        out->rx_bytes[t] = g_prof_rx[t];
+        out->weight_bytes[t] = g_prof_weight_bytes[t];
+        out->activation_bytes[t] = g_prof_activation_bytes[t];
+    }
+}
 
 extern "C" int ds4_gpu_device_is_spark(void) {
     return g_n_gpus == 1 && g_device_is_spark;
@@ -545,6 +1283,17 @@ struct cuda_device_cache {
     int     present;
 };
 static cuda_device_cache g_dev_cache[DS4_MAX_GPUS];
+
+/* Per-device override for the slab-alloc safety margin (MiB); 0 = default
+ * 2 GiB. A non-primary expert-cache tier needs far less headroom than the
+ * primary (the graph scratch lives on the primary), so it can raise its slab
+ * toward the whole device to hold more resident experts. */
+static int g_dev_cache_safety_mib[DS4_MAX_GPUS] = {0};
+
+extern "C" void ds4_gpu_device_cache_set_safety_mib(int device_id, int mib) {
+    if (device_id < 0 || device_id >= DS4_MAX_GPUS) return;
+    g_dev_cache_safety_mib[device_id] = mib > 0 ? mib : 0;
+}
 
 struct cache_range_entry {
     uint64_t source_offset;
@@ -1138,8 +1887,12 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
              strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
              strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
              strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0);
-        if (off) {
-            fprintf(stderr, "ds4: DS4_CUDA_DECODE_GRAPHS=%s - decode graph capture disabled\n", s);
+        /* CPU expert offload uploads a host buffer and adds it on the legacy
+         * stream each layer; a captured graph cannot represent that. */
+        const int cpu_off = getenv("DS4_CUDA_CPU_EXPERTS") != NULL;
+        if (off || cpu_off) {
+            fprintf(stderr, "ds4: decode graph capture disabled (%s)\n",
+                    cpu_off ? "CPU expert offload" : s);
             enabled = 0;
         } else {
             enabled = 1;
@@ -1524,6 +2277,22 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
         dev_ptr) {
         return (const char *)dev_ptr;
     }
+    /* Streaming keeps the non-routed (dense) weights in the legacy
+     * model-range/FD/HMM maps instead of the per-device selective cache
+     * (only expert weights go in the selective cache). Those legacy maps
+     * are device-0 by construction (see the q8 preload note). So allow the
+     * legacy resolver only when the REQUESTING TIER'S PHYSICAL DEVICE is
+     * device 0 — the device those maps are valid on. A primary tier that is
+     * not device 0 therefore still fails loudly here rather than consuming
+     * a wrong-device pointer. The request must come from the primary tier
+     * too: the cache tier never resolves dense weights, and experts always
+     * hit the strict cache above. Resident multi-GPU dispatch is
+     * unaffected because all its weights sit in the selective cache. */
+    if (logical_tier == 0 && physical_device == 0) {
+        const char *legacy = cuda_model_range_ptr(model_map, offset, bytes,
+                                                  label ? label : "model");
+        if (legacy) return legacy;
+    }
     fprintf(stderr,
         "ds4: selective-cache miss for offset=%llu bytes=%llu on "
         "logical_tier=%d (physical_device=%d, current_device=%d, "
@@ -1584,7 +2353,14 @@ static void cuda_q8_f32_cache_release_all(void) {
  * them and retry. A device sync plus decode-graph invalidation guarantees no
  * queued kernel still references a freed buffer. Single-GPU only: the
  * multi-GPU path keeps weights in per-device selective caches, not here. */
-static uint64_t cuda_model_derived_cache_oom_evict(void) {
+/*
+ * Shed only the rebuildable Q8->F16/F32 derived caches, returning the bytes
+ * released. Kept separate from the pool drop so the streaming-table
+ * allocation path can reclaim memory without invalidating a pool it is about
+ * to read (the pool is only ever dropped by cuda_model_derived_cache_oom_evict
+ * or the scratch relief, never from the table path itself).
+ */
+static uint64_t cuda_derived_cache_evict_only(void) {
     if (g_n_gpus > 1) return 0;
     const uint64_t f16 = g_q8_f16_bytes;
     const uint64_t f32 = g_q8_f32_bytes;
@@ -1603,6 +2379,34 @@ static uint64_t cuda_model_derived_cache_oom_evict(void) {
                 (double)(f16 + f32) / 1048576.0);
     }
     return f16 + f32;
+}
+
+/*
+ * §7.2 fallback order: shed the rebuildable Q8->F16/F32 derived caches first,
+ * and only drop the hot expert pool when those were already gone. Both are
+ * pure speed caches, but the pool is the more valuable one: a dropped pool
+ * loses every resident expert and the next token re-reads them from host/SSD,
+ * while a derived cache is rebuilt lazily per tensor. Clearing
+ * g_model_cache_full after each relief makes the arena retry, so a pool drop
+ * only happens when the derived caches alone were not enough.
+ */
+static uint64_t cuda_model_derived_cache_oom_evict(void) {
+    uint64_t freed = cuda_derived_cache_evict_only();
+    if (freed != 0) return freed;
+    if (g_expert_pool.valid) {
+        const uint64_t pool = cuda_expert_pool_bytes();
+        (void)cudaDeviceSynchronize();
+        (void)cudaGetLastError();
+        ds4_gpu_decode_graphs_invalidate();
+        cuda_expert_pool_drop();
+        g_model_cache_full = 0;
+        fprintf(stderr,
+                "ds4: CUDA released %.2f MiB of expert pool on model-range OOM; "
+                "routed experts stream per token\n",
+                (double)pool / 1048576.0);
+        return pool;
+    }
+    return 0;
 }
 
 /*
@@ -1625,23 +2429,21 @@ extern "C" uint64_t ds4_cuda_pool_oom_relief(void) {
     /* Freeing/synchronizing inside a graph capture would invalidate it; the
      * capture caller already retires the entry and re-encodes eagerly. */
     if (g_decode_graph_capturing) return 0;
-    uint64_t freed = 0;
-    for (uint32_t i = 0; i < DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS; i++) {
-        cuda_layer_resident_experts *r = &g_layer_resident[i];
-        if (!r->valid) continue;
-        freed += r->gate_capacity + r->up_capacity + r->down_capacity;
-        cuda_layer_resident_release_one(r);
-    }
-    if (freed != 0) {
-        g_stream_resident_slots_cap = 0;
-        if (getenv("DS4_CUDA_STREAM_RESIDENT") != NULL) {
+    /* §7.2: shed the rebuildable derived caches before the valuable hot pool,
+     * so a scratch OOM does not cost every resident expert unnecessarily. */
+    uint64_t freed = cuda_derived_cache_evict_only();
+    if (freed != 0) return freed;
+    if (g_expert_pool.valid) {
+        freed = cuda_expert_pool_bytes();
+        /* Auto pools re-arm later under the cooldown; explicit ones stay off. */
+        cuda_expert_pool_drop();
+        if (freed != 0) {
             fprintf(stderr,
-                    "ds4: CUDA released %.2f MiB of resident expert pools "
-                    "to satisfy scratch allocation; resident pool disabled\n",
+                    "ds4: CUDA released %.2f MiB of resident expert pool "
+                    "to satisfy scratch allocation\n",
                     (double)freed / 1048576.0);
         }
     }
-    freed += cuda_model_derived_cache_oom_evict();
     return freed;
 }
 
@@ -2510,7 +3312,10 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
+    /* Small chunks: the arena only needs to round the last chunk, and on a
+     * 12 GiB card a 1792 MiB default wasted ~1.3 GiB of VRAM that could hold
+     * resident experts. The cost is a few more cudaMalloc calls. */
+    uint64_t mb = 256;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
@@ -2558,6 +3363,20 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t min_chunk = 32ull * 1048576ull;
     void *dev = NULL;
     cudaError_t err = cudaSuccess;
+    /* Trust the device's actual free VRAM, not only the packer's budget: that
+     * budget can predate slabs already installed on this device (the dense /
+     * core cache), so growing into space that is really gone used to fail the
+     * run. Clamp the growth to the real room; the normal failure/eviction path
+     * below still applies when even the minimum chunk does not fit. */
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            const uint64_t floor = 512ull * 1048576ull;
+            const uint64_t room = (uint64_t)free_b > floor
+                ? (uint64_t)free_b - floor : 0;
+            if (chunk > room) chunk = room < min_chunk ? min_chunk : room;
+        }
+    }
     for (;;) {
         err = cudaMalloc(&dev, (size_t)chunk);
         if (err == cudaSuccess) break;
@@ -2657,6 +3476,8 @@ static const char *cuda_model_range_ptr_from_fd(
                     strerror(errno));
             return NULL;
         }
+        prof_note_tx(0, n);
+        prof_note_weight(0, n);
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
         if (err != cudaSuccess) {
@@ -3084,7 +3905,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     cuda_stream_selected_cache_release();
-    cuda_layer_resident_release_all();
+    cuda_expert_pool_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
@@ -3204,6 +4025,13 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
         WITH_DEVICE(g_gpu[d].device_id) {
             (void)cudaFree(t->ptr);
         }
+        /* Keep used_bytes a live total: without this it only ever grew, so
+         * reallocated per-turn/session buffers inflated the profiler's
+         * tensor figure for the rest of the run. */
+        if (d >= 0 && d < g_n_gpus && t->bytes != 0 &&
+            g_gpu[d].used_bytes >= t->bytes) {
+            g_gpu[d].used_bytes -= t->bytes;
+        }
     }
     t->ptr = NULL;
     t->bytes = 0;
@@ -3235,6 +4063,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = 0;
+    g_gpu[0].used_bytes += bytes;   /* managed still occupies VRAM */
     return t;
 }
 
@@ -3296,6 +4125,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t by
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = tier;
+    g_gpu[tier].used_bytes += bytes;   /* managed still occupies VRAM */
     return t;
 }
 
@@ -3357,6 +4187,10 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
         WITH_DEVICE(g_gpu[d].device_id) {
             (void)cudaFree(tensor->ptr);
         }
+        if (d >= 0 && d < g_n_gpus && tensor->bytes != 0 &&
+            g_gpu[d].used_bytes >= tensor->bytes) {
+            g_gpu[d].used_bytes -= tensor->bytes;
+        }
     }
     free(tensor);
 }
@@ -3388,10 +4222,17 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
+    const uint64_t t0 = prof_now_ns();
     WITH_DEVICE(g_gpu[d].device_id) {
         ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
                                 cudaMemcpyHostToDevice),
                      "tensor write");
+    }
+    const uint64_t wdt = prof_now_ns() - t0;
+    if (ok) {
+        prof_note_tx(d, bytes);
+        prof_note_activation(d, bytes);
+        ds4_profiler_note_step(DS4_PSTEP_XFER_ACT_HOST, wdt, 1, bytes);
     }
     return ok;
 }
@@ -3401,10 +4242,23 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
+        const uint64_t t0 = prof_now_ns();
         ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
                                 cudaMemcpyDeviceToHost),
                      "tensor read");
+        const uint64_t rdt = prof_now_ns() - t0;
+        g_prof_device_wait_ns += rdt;
+        g_prof_readback_ns += rdt;
+        ds4_profiler_note_step(DS4_PSTEP_WAIT_READBACK, rdt, 1, 0);
+        /* The vocabulary readback is hundreds of KiB; activation,
+         * partial and id readbacks are far smaller. Keeping them apart
+         * avoids charging every 24-byte id read to the logits row. */
+        ds4_profiler_note_step(bytes >= 256u * 1024u
+                                   ? DS4_PSTEP_XFER_LOGITS
+                                   : DS4_PSTEP_XFER_ACT_READBACK,
+                               0, 1, bytes);
     }
+    if (ok) { prof_note_rx(d, bytes); prof_note_activation(d, bytes); }
     return ok;
 }
 
@@ -3521,6 +4375,14 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
         return ok;
     }
 
+    /* Cross-device payload: it lands in dst, so the receiver's inbound link and
+     * the sender's outbound link both carry it (tx = into the device, per the
+     * profiler's convention). Counted once here, whichever path below runs. */
+    prof_note_tx(dd, bytes);
+    prof_note_rx(sd, bytes);
+    prof_note_activation(dd, bytes);
+    prof_note_activation(sd, bytes);
+
     int peer = g_gpu_peer_ok[sd][dd];
     if (g_xdev_force_cuda_peer)   peer = 1;
     if (g_xdev_force_host_bounce) peer = 0;
@@ -3593,7 +4455,11 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                         const ds4_gpu_tensor *src,
                                         uint64_t bytes) {
-    return ds4_gpu_tensor_copy_xdev_impl(dst, src, bytes, false);
+    const uint64_t t0 = prof_now_ns();
+    const int ok = ds4_gpu_tensor_copy_xdev_impl(dst, src, bytes, false);
+    if (ok)
+        ds4_profiler_note_step(DS4_PSTEP_XFER_PEER, prof_now_ns() - t0, 1, bytes);
+    return ok;
 }
 
 static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
@@ -3612,6 +4478,12 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
         }
         return ok;
     }
+
+    /* Cross-device: inbound on the receiver, outbound on the sender. */
+    prof_note_tx(dd, bytes);
+    prof_note_rx(sd, bytes);
+    prof_note_activation(dd, bytes);
+    prof_note_activation(sd, bytes);
 
     int peer = g_gpu_peer_ok[sd][dd];
     if (g_xdev_force_cuda_peer) peer = 1;
@@ -3667,7 +4539,11 @@ static int ds4_gpu_tensor_copy_xdev_default_impl(ds4_gpu_tensor *dst,
 extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                                  const ds4_gpu_tensor *src,
                                                  uint64_t bytes) {
-    return ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
+    const uint64_t t0 = prof_now_ns();
+    const int ok = ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
+    if (ok)
+        ds4_profiler_note_step(DS4_PSTEP_XFER_PEER, prof_now_ns() - t0, 1, bytes);
+    return ok;
 }
 
 extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
@@ -3947,20 +4823,41 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
-extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
-extern "C" int ds4_gpu_end_commands(void) {
-    if (g_cuda_end_stream_sync) {
-        return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
-    }
-    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+extern "C" int ds4_gpu_flush_commands(void) {
+    const uint64_t t0 = prof_now_ns();
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "flush");
+    const uint64_t dt = prof_now_ns() - t0;
+    g_prof_device_wait_ns += dt;
+    ds4_profiler_note_step(DS4_PSTEP_WAIT_SYNC, dt, 1, 0);
+    return ok;
 }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+extern "C" int ds4_gpu_end_commands(void) {
+    const uint64_t t0 = prof_now_ns();
+    int ok;
+    if (g_cuda_end_stream_sync) {
+        ok = cuda_ok(cudaStreamSynchronize(0), "end commands stream");
+    } else {
+        ok = cuda_ok(cudaDeviceSynchronize(), "end commands");
+    }
+    const uint64_t dt = prof_now_ns() - t0;
+    g_prof_device_wait_ns += dt;
+    ds4_profiler_note_step(DS4_PSTEP_WAIT_SYNC, dt, 1, 0);
+    return ok;
+}
+extern "C" int ds4_gpu_synchronize(void) {
+    const uint64_t t0 = prof_now_ns();
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "synchronize");
+    const uint64_t dt = prof_now_ns() - t0;
+    g_prof_device_wait_ns += dt;
+    ds4_profiler_note_step(DS4_PSTEP_WAIT_SYNC, dt, 1, 0);
+    return ok;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
-    cuda_layer_resident_release_all();
+    cuda_expert_pool_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -4134,7 +5031,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
     cuda_stream_selected_cache_release();
-    cuda_layer_resident_release_all();
+    cuda_expert_pool_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -4340,7 +5237,12 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
              * headroom a borderline budget that fits the slab itself can
              * still OOM at the per-tier tensor allocations a few moments
              * later — same silent-late-OOM failure mode, one layer up. */
-            const size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+            size_t safety = (size_t)2ull * 1024ull * 1024ull * 1024ull;
+            if (device_id >= 0 && device_id < DS4_MAX_GPUS &&
+                g_dev_cache_safety_mib[device_id] > 0) {
+                safety = (size_t)g_dev_cache_safety_mib[device_id] *
+                         1024ull * 1024ull;
+            }
             const size_t need = new_bytes + safety;
             if (need > free_b) {
                 fprintf(stderr,
@@ -4829,6 +5731,21 @@ extern "C" int ds4_gpu_model_range_replaced(
     return 0;
 }
 
+/* True when [offset, bytes) already lives in the per-device selective weight
+ * cache (the permanent store used by the dense/resident install). Lets the
+ * startup span preparation skip tensors that are already resident instead of
+ * paging a second copy into the greedy arena. */
+extern "C" int ds4_gpu_range_selectively_cached(uint64_t offset, uint64_t bytes) {
+    if (bytes == 0) return 0;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    void *ptr = NULL;
+    return ds4_gpu_lookup_cache_strict(offset, bytes, dev, &ptr) && ptr != NULL;
+}
+
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
@@ -4917,6 +5834,17 @@ __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w
     out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)token * n_embd + e]);
 }
 
+__global__ static void embed_token_hc_q8_0_kernel(float *out, const unsigned char *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = n_embd * n_hc;
+    if (i >= n) return;
+    uint32_t e = i % n_embd;
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *blk = w + ((uint64_t)token * row_blocks + (e >> 5)) * 34u;
+    const float d = __half2float(*(const __half *)blk);
+    out[i] = d * (float)((const int8_t *)(blk + 2))[e & 31u];
+}
+
 __global__ static void embed_tokens_hc_kernel(
         float *out,
         const int32_t *tokens,
@@ -4935,6 +5863,29 @@ __global__ static void embed_tokens_hc_kernel(
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
+}
+
+__global__ static void embed_tokens_hc_q8_0_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *w,
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n) return;
+    uint32_t d = gid % n_embd;
+    uint64_t tmp = gid / n_embd;
+    uint32_t t = tmp / n_hc;
+    int32_t tok_i = tokens[t];
+    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
+    if (tok >= n_vocab) tok = 0;
+    const uint64_t row_blocks = n_embd / 32u;
+    const unsigned char *blk = w + ((uint64_t)tok * row_blocks + (d >> 5)) * 34u;
+    const float dd = __half2float(*(const __half *)blk);
+    out[gid] = dd * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
 __global__ static void matmul_f16_kernel(
@@ -5203,6 +6154,31 @@ __global__ static void pack_slot_rows_f32_kernel(float *out, const float *slots,
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __float2half(x[i]);
+}
+
+/* Expand an F16 attention-compressed KV cache to the F32 layout the attention
+ * kernels consume. Memory policy: the engine halves the persistent per-layer
+ * compressed cache, and the read path pays one expansion pass per attention
+ * call so the F32 kernels stay unchanged and validated. */
+__global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(x[i]);
+}
+
+/* Indexed variant: expand only the top-k selected compressed rows, writing them
+ * back at their original row positions. Keeping the positions means the
+ * indexer's top-k indices and the visible-row bound stay valid unchanged. */
+__global__ static void attn_comp_gather_f16_kernel(
+        float *out, const __half *comp, const int32_t *topk,
+        uint64_t n_rows, uint32_t n_comp, uint32_t head_dim) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = n_rows * head_dim;
+    if (i >= n) return;
+    const int32_t row = topk[i / head_dim];
+    if (row < 0 || (uint32_t)row >= n_comp) return;   /* padding / stale entry */
+    const uint32_t d = (uint32_t)(i % head_dim);
+    out[(uint64_t)row * head_dim + d] =
+        __half2float(comp[(uint64_t)row * head_dim + d]);
 }
 
 __device__ static float warp_sum_f32(float v) {
@@ -14353,16 +15329,22 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
-extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
+extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc, uint32_t weight_type) {
     (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
-    uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+    const uint64_t weight_bytes = weight_type == 8u
+        ? (uint64_t)n_vocab * ((uint64_t)n_embd / 32u) * 34u
+        : (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const int logical_tier = ds4_tensor_device_idx(out_hc);
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "token_embd");
     if (!wptr) return 0;
     uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    if (weight_type == 8u) {
+        embed_token_hc_q8_0_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned char *)wptr, token, n_embd, n_hc);
+    } else {
+        embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+    }
     return cuda_ok(cudaGetLastError(), "embed token launch");
 }
 
@@ -14375,26 +15357,37 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc,
+        uint32_t                weight_type) {
+    const uint64_t weight_bytes = weight_type == 8u
+        ? (uint64_t)n_vocab * ((uint64_t)n_embd / 32u) * 34u
+        : (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (!out_hc || !tokens_t || !model_map ||
         weight_offset > model_size ||
-        (uint64_t)n_vocab * n_embd * sizeof(uint16_t) > model_size - weight_offset ||
+        weight_bytes > model_size - weight_offset ||
         tokens_t->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
         out_hc->bytes < (uint64_t)n_tokens * n_hc * n_embd * sizeof(float)) {
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out_hc);
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
-                                                (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
-                                                logical_tier,
+                                                weight_bytes, logical_tier,
                                                 "token_embd");
     if (!wptr) return 0;
     uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (float *)out_hc->ptr,
-        (const int32_t *)tokens_t->ptr,
-        (const __half *)wptr,
-        n_vocab, n_tokens, n_embd, n_hc);
+    if (weight_type == 8u) {
+        embed_tokens_hc_q8_0_kernel<<<(n + 255) / 256, 256>>>(
+            (float *)out_hc->ptr,
+            (const int32_t *)tokens_t->ptr,
+            (const unsigned char *)wptr,
+            n_vocab, n_tokens, n_embd, n_hc);
+    } else {
+        embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+            (float *)out_hc->ptr,
+            (const int32_t *)tokens_t->ptr,
+            (const __half *)wptr,
+            n_vocab, n_tokens, n_embd, n_hc);
+    }
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
 }
 
@@ -17547,6 +18540,104 @@ static int attention_decode_splitkv_launch(
     return 1;
 }
 
+/* =========================================================================
+ * F16 compressed attention cache read path.
+ *
+ * The engine may store each layer's compressed attention KV cache in F16. The
+ * CUDA attention kernels are F32 and proven, so instead of porting every kernel
+ * the selected rows are expanded into a reusable per-tier F32 scratch that
+ * keeps the original row positions. The F32 kernels and the indexer top-k then
+ * need no changes; only the bytes moved per attention call change.
+ * ========================================================================= */
+#define CUDA_ATTN_COMP_SCRATCH_TIERS DS4_MAX_GPUS
+static ds4_gpu_tensor *g_attn_comp_scratch[CUDA_ATTN_COMP_SCRATCH_TIERS];
+
+/* Grow-on-demand F32 scratch for the expanded compressed cache. Sized by the
+ * first (pre-capture) use so the allocation never lands inside a graph capture. */
+static int cuda_attn_comp_debug(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_CUDA_KV_F16_DEBUG") != NULL;
+    return v;
+}
+
+static ds4_gpu_tensor *cuda_attn_comp_scratch(int tier, uint64_t bytes) {
+    if (tier < 0 || tier >= CUDA_ATTN_COMP_SCRATCH_TIERS) {
+        if (cuda_attn_comp_debug()) fprintf(stderr, "KVF16: bad tier %d\n", tier);
+        return NULL;
+    }
+    if (g_attn_comp_scratch[tier] && g_attn_comp_scratch[tier]->bytes >= bytes) {
+        return g_attn_comp_scratch[tier];
+    }
+    if (g_decode_graph_capturing) {
+        if (cuda_attn_comp_debug()) fprintf(stderr, "KVF16: grow %llu during capture\n",
+                                            (unsigned long long)bytes);
+        return NULL;
+    }
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+    if (!t) {
+        if (cuda_attn_comp_debug()) fprintf(stderr, "KVF16: alloc %llu failed\n",
+                                            (unsigned long long)bytes);
+        return NULL;
+    }
+    ds4_gpu_tensor_free(g_attn_comp_scratch[tier]);
+    g_attn_comp_scratch[tier] = t;
+    return t;
+}
+
+/* Dense: expand all n_comp rows. */
+static ds4_gpu_tensor *cuda_attn_comp_expand_dense(
+        const ds4_gpu_tensor *comp_kv, uint32_t n_comp, uint32_t head_dim) {
+    const uint64_t count = (uint64_t)n_comp * head_dim;
+    if (comp_kv->bytes < count * sizeof(__half)) {
+        if (cuda_attn_comp_debug()) fprintf(stderr,
+            "KVF16 dense: comp bytes %llu < %llu\n",
+            (unsigned long long)comp_kv->bytes,
+            (unsigned long long)(count * sizeof(__half)));
+        return NULL;
+    }
+    ds4_gpu_tensor *dst = cuda_attn_comp_scratch(
+        ds4_tensor_device_idx(comp_kv), count * sizeof(float));
+    if (!dst) return NULL;
+    if (ds4_gpu_set_current_device(ds4_tensor_device_idx(comp_kv)) != 0) return NULL;
+    f16_to_f32_kernel<<<(unsigned)((count + 255u) / 256u), 256, 0,
+                        cuda_decode_stream()>>>(
+        (float *)dst->ptr, (const __half *)comp_kv->ptr, count);
+    if (!cuda_ok(cudaGetLastError(), "attn comp f16 expand launch")) return NULL;
+    return dst;
+}
+
+/* Indexed: expand only the selected rows into their original positions. */
+static ds4_gpu_tensor *cuda_attn_comp_expand_indexed(
+        const ds4_gpu_tensor *comp_kv, const ds4_gpu_tensor *topk,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t top_k, uint32_t head_dim) {
+    if (!topk) {
+        if (cuda_attn_comp_debug()) fprintf(stderr, "KVF16 indexed: no topk\n");
+        return NULL;
+    }
+    const uint64_t count = (uint64_t)n_comp * head_dim;
+    if (comp_kv->bytes < count * sizeof(__half) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
+        if (cuda_attn_comp_debug()) fprintf(stderr,
+            "KVF16 indexed: comp %llu/%llu topk %llu/%llu\n",
+            (unsigned long long)comp_kv->bytes,
+            (unsigned long long)(count * sizeof(__half)),
+            (unsigned long long)topk->bytes,
+            (unsigned long long)((uint64_t)n_tokens * top_k * sizeof(int32_t)));
+        return NULL;
+    }
+    ds4_gpu_tensor *dst = cuda_attn_comp_scratch(
+        ds4_tensor_device_idx(comp_kv), count * sizeof(float));
+    if (!dst) return NULL;
+    if (ds4_gpu_set_current_device(ds4_tensor_device_idx(comp_kv)) != 0) return NULL;
+    const uint64_t sel = (uint64_t)n_tokens * top_k;
+    attn_comp_gather_f16_kernel<<<(unsigned)((sel * head_dim + 255u) / 256u), 256, 0,
+                                  cuda_decode_stream()>>>(
+        (float *)dst->ptr, (const __half *)comp_kv->ptr,
+        (const int32_t *)topk->ptr, sel, n_comp, head_dim);
+    if (!cuda_ok(cudaGetLastError(), "attn comp f16 gather launch")) return NULL;
+    return dst;
+}
+
 extern "C" int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -17564,6 +18655,13 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_dense(comp_kv, n_comp, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
@@ -18322,6 +19420,13 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_dense(comp_kv, n_comp, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
@@ -18350,6 +19455,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_indexed(comp_kv, topk, n_comp, n_tokens,
+                                                    top_k, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (comp_kv_f16 ||
         !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -18724,6 +19837,13 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_dense(comp_kv, n_comp, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, NULL, 0, n_tokens,
@@ -18746,6 +19866,13 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_dense(comp_kv, n_comp, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
@@ -18775,6 +19902,13 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
+    if (comp_kv_f16) {
+        if (n_comp) {
+            comp_kv = cuda_attn_comp_expand_dense(comp_kv, n_comp, head_dim);
+            if (!comp_kv) return 0;
+        }
+        comp_kv_f16 = 0;   /* cache format is backend state, not a kernel input */
+    }
     if (!heads || !model_map || !q || !raw_kv || !tokens || vocab_size == 0 ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && (!comp_kv || ratio == 0)) ||
@@ -24194,6 +25328,37 @@ __global__ static void moe_sum_owned_kernel(
     out[gid] = acc;
 }
 
+/* Sum the owned per-slot down outputs, skipping slots whose expert id is not
+ * resident on this tier. The owned down kernels return before writing slots
+ * they do not own, so those slots hold uninitialized memory and must not be
+ * folded into the routed partial. */
+__global__ static void moe_sum_owned_range_kernel(
+        float *out,
+        const float *down,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t expert_base,
+        uint32_t expert_count) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        uint32_t local = 0;
+        if (!moe_owned_local_expert(selected[(uint64_t)tok * n_expert + slot],
+                                    expert_base, expert_count, &local)) {
+            continue;
+        }
+        acc = __fadd_rn(acc,
+                        down[((uint64_t)tok * n_expert + slot) * out_dim + row]);
+    }
+    out[gid] = acc;
+}
+
 __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
     float acc = 0.0f;
     for (uint32_t b = 0; b < nb; b++) {
@@ -25909,7 +27074,11 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
         const ds4_gpu_tensor *x,
         ds4_gpu_tensor *down_output,
         bool pack_fixed3,
-        ds4_gpu_tensor *shared_prequant) {
+        ds4_gpu_tensor *shared_prequant,
+        uint64_t gate_bank_offset,
+        uint64_t up_bank_offset,
+        uint64_t down_bank_offset) {
+    const Ds4ProfComputeScope prof_scope_owned;
     if (!out || !gate || !up || !mid || !down || !model_map ||
         !selected || !weights || !x || n_expert != 6u ||
         n_total_expert == 0u || resident_expert_count == 0u ||
@@ -25956,24 +27125,39 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
     const uint64_t down_shift = (uint64_t)resident_expert_base * down_expert_bytes;
     const uint64_t gate_bytes = (uint64_t)resident_expert_count * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)resident_expert_count * down_expert_bytes;
-    if (gate_offset > model_size || gate_shift > model_size - gate_offset ||
-        gate_bytes > model_size - gate_offset - gate_shift ||
-        up_offset > model_size || gate_shift > model_size - up_offset ||
-        gate_bytes > model_size - up_offset - gate_shift ||
-        down_offset > model_size || down_shift > model_size - down_offset ||
-        down_bytes > model_size - down_offset - down_shift) {
+    /* Resolution range. The frequency-ranked path hands the source offset of
+     * the first resident expert and resolves one expert's bytes there: the
+     * slab packs the installed per-expert ranges contiguously, so the bank
+     * base is bank_base + local*expert_bytes. The legacy path resolves the
+     * whole contiguous [base, base+count) range. */
+    const uint64_t gate_res_off = gate_bank_offset ? gate_bank_offset
+                                                   : gate_offset + gate_shift;
+    const uint64_t up_res_off = up_bank_offset ? up_bank_offset
+                                               : up_offset + gate_shift;
+    const uint64_t down_res_off = down_bank_offset ? down_bank_offset
+                                                   : down_offset + down_shift;
+    const uint64_t gate_res_bytes = gate_bank_offset ? gate_expert_bytes
+                                                     : gate_bytes;
+    const uint64_t down_res_bytes = down_bank_offset ? down_expert_bytes
+                                                     : down_bytes;
+    if (gate_res_off > model_size ||
+        gate_res_bytes > model_size - gate_res_off ||
+        up_res_off > model_size ||
+        gate_res_bytes > model_size - up_res_off ||
+        down_res_off > model_size ||
+        down_res_bytes > model_size - down_res_off) {
         return 0;
     }
 
     const int logical_tier = ds4_tensor_device_idx(out);
     const char *gate_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, gate_offset + gate_shift, gate_bytes,
+            model_map, gate_res_off, gate_res_bytes,
             logical_tier, "moe_owned_gate");
     const char *up_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, up_offset + gate_shift, gate_bytes,
+            model_map, up_res_off, gate_res_bytes,
             logical_tier, "moe_owned_up");
     const char *down_w = (const char *)cuda_resolve_weight_ptr(
-            model_map, down_offset + down_shift, down_bytes,
+            model_map, down_res_off, down_res_bytes,
             logical_tier, "moe_owned_down");
     if (!gate_w || !up_w || !down_w) return 0;
 
@@ -26251,6 +27435,37 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_tensor(
             out_dim, expert_split, 1u);
 }
 
+/* Sum the per-slot outputs left by ds4_gpu_routed_moe_one_owned_tensor into a
+ * single routed vector. Used by the streaming cache-tier offload, which has a
+ * single owned tier and no peer combine. The per-slot gate/up already applied
+ * the route weights. Only slots owned by [expert_base, expert_base+count) are
+ * summed; the owned down kernels leave other slots unwritten. */
+extern "C" int ds4_gpu_routed_moe_owned_sum_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *slots,
+        const ds4_gpu_tensor *selected,
+        uint32_t out_dim,
+        uint32_t n_slots,
+        uint32_t expert_base,
+        uint32_t expert_count) {
+    if (!out || !slots || !selected || out_dim == 0u || n_slots == 0u ||
+        expert_count == 0u) {
+        return 0;
+    }
+    if (out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        slots->bytes < (uint64_t)n_slots * out_dim * sizeof(float) ||
+        selected->bytes < (uint64_t)n_slots * sizeof(int32_t)) {
+        return 0;
+    }
+    const uint64_t n = out_dim;
+    moe_sum_owned_range_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0,
+                                 cuda_decode_stream()>>>(
+            (float *)out->ptr, (const float *)slots->ptr,
+            (const int32_t *)selected->ptr,
+            out_dim, n_slots, 1u, expert_base, expert_count);
+    return cuda_ok(cudaGetLastError(), "owned routed_moe sum launch");
+}
+
 extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         ds4_gpu_tensor *out,
         const ds4_gpu_tensor *home_slots,
@@ -26282,6 +27497,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         const ds4_gpu_tensor *add_in,
         uint32_t layer_index,
         bool force_resident) {
+    const Ds4ProfComputeScope prof_scope;
     if (add_in) {
         if (!ds4_gpu_add_tensor(out, out, add_in,
                                 (uint32_t)(out->bytes / sizeof(float)))) return 0;
@@ -26913,6 +28129,152 @@ extern "C" int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
     return 0;
 }
 
+/* §1.1 device probe for the role planner. Attribute-only (cheap) plus a pinned
+ * host<->device bandwidth sample, which is skipped for a single device because
+ * there is no relative ranking to make and single-GPU startup stays unchanged.
+ * Side-effect: leaves the CUDA context on the last probed device; the caller
+ * (ds4_gpu_init_multi) sets the device it needs. */
+static double cuda_probe_pcie_bw_gbps(int dev, uint64_t bytes) {
+    void *pinned = NULL;
+    void *dptr = NULL;
+    double best = 0.0;
+    if (cudaSetDevice(dev) != cudaSuccess) return 0.0;
+    if (cudaMallocHost(&pinned, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0.0;
+    }
+    if (cudaMalloc(&dptr, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(pinned);
+        return 0.0;
+    }
+    memset(pinned, 0, (size_t)bytes);
+    for (int rep = 0; rep < 3; rep++) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (cudaMemcpy(dptr, pinned, (size_t)bytes,
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pinned, dptr, (size_t)bytes,
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void)cudaGetLastError();
+            best = 0.0;
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double sec = (double)(t1.tv_sec - t0.tv_sec) +
+                           (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (sec > 0.0) {
+            const double gbps = 2.0 * (double)bytes / sec / 1e9;
+            if (gbps > best) best = gbps;
+        }
+    }
+    (void)cudaFree(dptr);
+    (void)cudaFreeHost(pinned);
+    return best;
+}
+
+extern "C" int ds4_gpu_roles_probe_cuda(const int *device_filter, int filter_len,
+                                        ds4_gpu_device_probe *out, int max_out,
+                                        int *out_n, char *err, size_t errlen) {
+    if (!out || !out_n || max_out <= 0) return 1;
+    *out_n = 0;
+    int visible = 0;
+    if (cudaGetDeviceCount(&visible) != cudaSuccess || visible <= 0) {
+        if (err && errlen) snprintf(err, errlen, "no CUDA devices visible");
+        (void)cudaGetLastError();
+        return 1;
+    }
+    int devs[DS4_MAX_GPUS];
+    int n = 0;
+    if (device_filter && filter_len > 0) {
+        if (filter_len > max_out || filter_len > DS4_MAX_GPUS) return 1;
+        for (int i = 0; i < filter_len; i++) {
+            const int d = device_filter[i];
+            if (d < 0 || d >= visible) {
+                if (err && errlen) snprintf(err, errlen, "device %d out of range", d);
+                return 1;
+            }
+            devs[n++] = d;
+        }
+    } else {
+        const int cap = visible < max_out ? visible : max_out;
+        for (int i = 0; i < cap; i++) devs[n++] = i;
+    }
+
+    for (int i = 0; i < n; i++) {
+        const int d = devs[i];
+        ds4_gpu_device_probe *p = &out[i];
+        memset(p, 0, sizeof(*p));
+        p->device_id = d;
+        if (cudaSetDevice(d) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 1;
+        }
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+            snprintf(p->name, sizeof(p->name), "%s", prop.name);
+            p->sm_count = prop.multiProcessorCount;
+            p->tensor_gen = prop.major * 10 + prop.minor;
+            /* CUDA 13 dropped the clock/bus fields from cudaDeviceProp. */
+            int mem_khz = 0, bus_bits = 0, clk_khz = 0;
+            (void)cudaDeviceGetAttribute(&mem_khz, cudaDevAttrMemoryClockRate, d);
+            (void)cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, d);
+            (void)cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, d);
+            p->vram_bw_gbps =
+                (double)mem_khz * 1000.0 * (double)bus_bits * 2.0 / 8.0 / 1e9;
+            p->fp16_tflops =
+                (double)p->sm_count * (double)clk_khz * 2.0 * 128.0 / 1e9;
+        }
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            p->vram_free_bytes = free_b;
+            p->vram_total_bytes = total_b;
+        }
+        for (int j = 0; j < n; j++) {
+            if (devs[j] == d) continue;
+            int can = 0;
+            (void)cudaDeviceCanAccessPeer(&can, d, devs[j]);
+            if (can) {
+                p->p2p_capable = 1;
+                int rank = 0;
+                if (cudaDeviceGetP2PAttribute(&rank, cudaDevP2PAttrPerformanceRank,
+                                              d, devs[j]) == cudaSuccess &&
+                    rank <= 1) {
+                    /* Performance rank 1 is the best link; treat it as an
+                     * NVLink-class hint. Informational only. */
+                    p->nvlink = 1;
+                }
+            }
+        }
+        (void)cudaGetLastError();
+    }
+
+    /* Measure the link for every device, including a lone one: the score is an
+     * absolute quality figure used for sizing/role decisions, not only a
+     * ranking between devices. A single device used to be skipped, which left
+     * its score at zero and made single-GPU behaviour inconsistent. */
+    if (n >= 1) {
+        uint64_t bytes = 128ull * 1024ull * 1024ull;
+        for (int i = 0; i < n; i++) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaSetDevice(devs[i]) == cudaSuccess &&
+                cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                /* Do not let one sample dominate a small card's free VRAM. */
+                uint64_t cap = free_b / 8u;
+                if (bytes > cap) bytes = cap;
+            }
+        }
+        if (bytes >= 16ull * 1024ull * 1024ull) {
+            for (int i = 0; i < n; i++) {
+                out[i].pcie_bw_gbps = cuda_probe_pcie_bw_gbps(devs[i], bytes);
+            }
+        }
+    }
+    *out_n = n;
+    return 0;
+}
+
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -26925,6 +28287,689 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
 
+/* --------------------------------------------------------------------------
+ * Host pinned expert arena.
+ *
+ * A byte-budgeted resident set of routed experts held in non-pageable host
+ * memory. A resident expert is handed to the streaming upload path as a
+ * pointer, so the upload becomes a single H2D DMA straight out of the arena:
+ * no file read, no page-cache copy, no CPU staging copy. That removes the host
+ * read that otherwise gates the PCIe link, and it turns residency into a fact
+ * the profiler can report instead of an inference from "the read happened
+ * once" (the kernel is free to evict a page-cache page at any time).
+ *
+ * The set is filled once from the process hotlist, hottest first, so its
+ * content is deterministic for a run and its size never fluctuates. It is a
+ * speed cache: an expert that is not resident, or one whose size class differs
+ * from the arena's, is read exactly as before. A small or failed arena
+ * therefore costs throughput, never correctness.
+ *
+ * Preload is the backbone. Runtime admission (DS4_HOST_ARENA_ADMIT) lets a
+ * fetched expert claim a slot and be filled by the read the fetch already
+ * needed, so a long session can adapt to routing the hotlist did not predict.
+ * ------------------------------------------------------------------------ */
+
+/* A slot's gate size class while it is claimed by the current layer's read but
+ * not yet filled. No real expert has a one-byte gate tensor, so a claimed slot
+ * can never be mistaken for resident, and an aborted layer leaves it
+ * reclaimable rather than leaked. */
+#define CUDA_HOST_ARENA_CLAIMED 1u
+
+typedef struct {
+    int      enabled;
+    char    *base;            /* pinned arena (cudaMallocHost, page aligned) */
+    uint64_t capacity;        /* usable bytes */
+    uint64_t gate_bytes;      /* nominal gate/up tensor bytes per expert */
+    uint64_t down_bytes;      /* nominal down tensor bytes per expert */
+    uint64_t stride;          /* nominal entry stride: 2*gate + down */
+    uint32_t max_slots;
+    uint32_t slot_count;      /* slots ever committed; also the next free slot */
+    uint32_t n_total_expert;
+    int32_t *index;           /* [layer*n_total_expert + expert] -> slot, -1 */
+    uint64_t *slot_off;       /* entry byte offset in base */
+    uint64_t *slot_gate;      /* per-slot size class; 0 when never filled */
+    uint64_t *slot_down;
+    uint32_t *slot_layer;     /* owner of each slot, for eviction */
+    uint32_t *slot_expert;
+    uint64_t *slot_use;       /* LFU frequency, incremented on every hit */
+    uint64_t *slot_last_load; /* load epoch of the last hit; see load_epoch */
+    uint64_t  load_epoch;     /* bumped once per layer load, marks this call's hits */
+    uint8_t  *seen_score;     /* [key] saturating fetch count, drives admission */
+    uint8_t  *ever_evicted;   /* [key] set when the expert has been evicted */
+    uint32_t  admit_threshold;/* fetches before an expert may be admitted */
+    /* Observability: expert selections that reached this seam (i.e. were not
+     * already resident on a device tier), split by where the bytes came from,
+     * plus the runtime admission/eviction traffic. */
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;      /* experts admitted at runtime */
+    uint64_t evictions;       /* LFU victims replaced */
+    uint64_t evicted_fetches; /* fetches of an expert the arena had evicted */
+} cuda_host_arena;
+
+static cuda_host_arena g_host_arena;
+
+/* Mirrors ds4_gpu_host_arena_stats_t in ds4_gpu.h: this translation unit keeps
+ * its own typedefs rather than including the public header, so the two must
+ * stay in sync (see the ds4_gpu_stream_expert_table note above). */
+typedef struct {
+    uint64_t capacity_bytes;
+    uint64_t used_bytes;
+    uint32_t experts;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;
+    uint64_t evictions;
+    uint64_t evicted_fetches;
+} ds4_gpu_host_arena_stats_t;
+
+static void cuda_host_arena_free(void) {
+    if (g_host_arena.base) {
+        (void)cudaFreeHost(g_host_arena.base);
+        g_host_arena.base = NULL;
+    }
+    free(g_host_arena.index);
+    free(g_host_arena.slot_off);
+    free(g_host_arena.slot_gate);
+    free(g_host_arena.slot_down);
+    free(g_host_arena.slot_layer);
+    free(g_host_arena.slot_expert);
+    free(g_host_arena.slot_use);
+    free(g_host_arena.slot_last_load);
+    free(g_host_arena.seen_score);
+    free(g_host_arena.ever_evicted);
+    memset(&g_host_arena, 0, sizeof(g_host_arena));
+}
+
+/* Allocate the (layer, expert) index once, on the first seed call, when the
+ * model's expert count is finally known. */
+static int cuda_host_arena_index_ensure(uint32_t n_total_expert) {
+    if (n_total_expert == 0) return 0;
+    if (g_host_arena.index && g_host_arena.n_total_expert == n_total_expert) {
+        return 1;
+    }
+    if (g_host_arena.n_total_expert != 0) return 0;   /* mixed counts: unsupported */
+    const uint64_t cells =
+        (uint64_t)DS4_CUDA_EXPERT_POOL_MAX_LAYERS * n_total_expert;
+    if (cells > SIZE_MAX / sizeof(int32_t)) return 0;
+    int32_t *index = (int32_t *)malloc((size_t)cells * sizeof(int32_t));
+    uint8_t *seen = (uint8_t *)calloc((size_t)cells, 1);
+    uint8_t *evicted = (uint8_t *)calloc((size_t)cells, 1);
+    if (!index || !seen || !evicted) {
+        free(index);
+        free(seen);
+        free(evicted);
+        return 0;
+    }
+    for (uint64_t i = 0; i < cells; i++) index[i] = -1;
+    g_host_arena.index = index;
+    g_host_arena.seen_score = seen;
+    g_host_arena.ever_evicted = evicted;
+    g_host_arena.n_total_expert = n_total_expert;
+    return 1;
+}
+
+static uint64_t cuda_host_arena_stride(uint64_t gate_bytes, uint64_t down_bytes) {
+    return gate_bytes * 2u + down_bytes;
+}
+
+/* Resolve a (layer, expert) to its arena tensors. Returns 1 on a size-class
+ * match, 0 when the expert must be read from the file. Cheap early-out when
+ * the arena is disabled, since this runs per selected expert per layer. */
+static int cuda_host_arena_resolve(uint32_t layer, uint32_t expert,
+                                   uint64_t gate_bytes, uint64_t down_bytes,
+                                   const char **gate, const char **up,
+                                   const char **down) {
+    if (!g_host_arena.enabled || !g_host_arena.index ||
+        layer >= DS4_CUDA_EXPERT_POOL_MAX_LAYERS ||
+        expert >= g_host_arena.n_total_expert) {
+        return 0;
+    }
+    const int32_t slot = g_host_arena.index[
+        (size_t)layer * g_host_arena.n_total_expert + expert];
+    if (slot < 0 || (uint32_t)slot >= g_host_arena.slot_count) return 0;
+    if (g_host_arena.slot_gate[slot] != gate_bytes ||
+        g_host_arena.slot_down[slot] != down_bytes) {
+        return 0;
+    }
+    const char *g = g_host_arena.base + g_host_arena.slot_off[slot];
+    /* Mark the slot as read by this load so an admission in the same layer
+     * cannot evict it out from under the in-flight upload, then vote for it. */
+    g_host_arena.slot_last_load[slot] = g_host_arena.load_epoch;
+    /* Frequency drives eviction, so every hit is a vote. A slot that has grown
+     * far hotter than the rest would otherwise be immune forever, so halve all
+     * votes once one saturates: a slow decay that lets the set follow the
+     * session instead of a cold start. */
+    if (++g_host_arena.slot_use[slot] > (1u << 20)) {
+        for (uint32_t s = 0; s < g_host_arena.slot_count; s++) {
+            g_host_arena.slot_use[s] >>= 1;
+        }
+    }
+    *gate = g;
+    *up = g + gate_bytes;
+    *down = g + 2u * gate_bytes;
+    return 1;
+}
+
+/* Drop the least-frequently-used resident expert and hand back its slot.
+ * Slots resolved as hits for the layer being loaded are never chosen: the
+ * async H2D uploads read straight out of the arena, so evicting one mid-layer
+ * could overwrite bytes a copy is about to read. `load_epoch` marks exactly the
+ * slots this call resolved, no more. */
+static uint32_t cuda_host_arena_evict_victim(void) {
+    uint32_t victim = UINT32_MAX;
+    uint64_t best = UINT64_MAX;
+    for (uint32_t s = 0; s < g_host_arena.slot_count; s++) {
+        if (g_host_arena.slot_gate[s] <= CUDA_HOST_ARENA_CLAIMED) continue;
+        if (g_host_arena.slot_last_load[s] == g_host_arena.load_epoch) continue;
+        if (g_host_arena.slot_use[s] < best) {
+            best = g_host_arena.slot_use[s];
+            victim = s;
+        }
+    }
+    if (victim == UINT32_MAX) return UINT32_MAX;
+    const uint32_t layer = g_host_arena.slot_layer[victim];
+    const uint32_t expert = g_host_arena.slot_expert[victim];
+    if (layer < DS4_CUDA_EXPERT_POOL_MAX_LAYERS &&
+        expert < g_host_arena.n_total_expert) {
+        const size_t key = (size_t)layer * g_host_arena.n_total_expert + expert;
+        if (g_host_arena.index[key] == (int32_t)victim) {
+            g_host_arena.index[key] = -1;
+        }
+        g_host_arena.ever_evicted[key] = 1;
+    }
+    g_host_arena.slot_gate[victim] = 0;
+    g_host_arena.evictions++;
+    return victim;
+}
+
+/* Hand out a slot to fill: a free one first, then spare capacity, and only
+ * then the LFU victim. A slot already claimed by *this* layer carries the
+ * sentinel and must be skipped, or two claims in one layer would land on the
+ * same slot and serve each other's bytes; claims left behind by an aborted
+ * layer are released by cuda_host_arena_reclaim_claims() at the next layer. */
+static uint32_t cuda_host_arena_take_slot(void) {
+    for (uint32_t s = 0; s < g_host_arena.slot_count; s++) {
+        if (g_host_arena.slot_gate[s] == 0) return s;
+    }
+    if (g_host_arena.slot_count < g_host_arena.max_slots) {
+        return g_host_arena.slot_count++;
+    }
+    return cuda_host_arena_evict_victim();
+}
+
+/* Release claims that were never committed (an aborted load) back to free.
+ * Called once per layer, before any new claim, so a partially-filled slot can
+ * never be mistaken for free while its read is still in flight. */
+static void cuda_host_arena_reclaim_claims(void) {
+    for (uint32_t s = 0; s < g_host_arena.slot_count; s++) {
+        if (g_host_arena.slot_gate[s] == CUDA_HOST_ARENA_CLAIMED) {
+            g_host_arena.slot_gate[s] = 0;
+        }
+    }
+}
+
+/* Decide whether a fetched expert should be filed in the arena, and claim a
+ * slot for it. The read worker fills the slot as a side effect of the read it
+ * is already doing, so admission adds no read, no device round trip and no
+ * extra seek — only a parallel copy in the read thread. Admission needs a
+ * repeat offence (DS4_HOST_ARENA_ADMIT), so a one-shot read can never displace
+ * a resident expert; the victim is the least-used, so the set follows what the
+ * session actually routes to. Returns 1 and sets *slot_out when claimed. */
+static int cuda_host_arena_reserve(uint32_t layer, uint32_t expert,
+                                   uint64_t gate_bytes, uint64_t down_bytes,
+                                   uint32_t *slot_out) {
+    if (!g_host_arena.enabled || !g_host_arena.index) return 0;
+    if (g_host_arena.admit_threshold == UINT32_MAX) return 0;
+    if (layer >= DS4_CUDA_EXPERT_POOL_MAX_LAYERS ||
+        expert >= g_host_arena.n_total_expert) {
+        return 0;
+    }
+    /* One size class only: the table's layout must match the arena's. */
+    if (gate_bytes != g_host_arena.gate_bytes ||
+        down_bytes != g_host_arena.down_bytes) {
+        return 0;
+    }
+    const size_t key = (size_t)layer * g_host_arena.n_total_expert + expert;
+    if (g_host_arena.index[key] >= 0) return 0;        /* already resident */
+    uint8_t *score = &g_host_arena.seen_score[key];
+    if (*score < 255) (*score)++;
+    if (*score < g_host_arena.admit_threshold) return 0;
+    const uint32_t slot = cuda_host_arena_take_slot();
+    if (slot == UINT32_MAX) return 0;
+    /* Never claim a live slot. take_slot() only ever returns a free or
+     * abandoned one, so this cannot fire today — but it is the exact invariant
+     * whose absence let two same-layer claims share a slot and serve each
+     * other's bytes, so it is worth a branch to keep it true. */
+    if (g_host_arena.slot_gate[slot] > CUDA_HOST_ARENA_CLAIMED) return 0;
+    g_host_arena.slot_gate[slot] = CUDA_HOST_ARENA_CLAIMED;
+    *slot_out = slot;
+    return 1;
+}
+
+/* Publish a filled claim as resident. Called once the layer's reads have all
+ * completed, so a partial fill is never committed. */
+static void cuda_host_arena_commit(uint32_t layer, uint32_t expert,
+                                   uint32_t slot, uint64_t gate_bytes,
+                                   uint64_t down_bytes) {
+    if (slot >= g_host_arena.slot_count) return;
+    if (g_host_arena.slot_gate[slot] != CUDA_HOST_ARENA_CLAIMED) return;
+    g_host_arena.slot_gate[slot] = gate_bytes;
+    g_host_arena.slot_down[slot] = down_bytes;
+    g_host_arena.slot_layer[slot] = layer;
+    g_host_arena.slot_expert[slot] = expert;
+    /* A runtime admit starts behind the preload's prior, so it must earn its
+     * place with real hits before it can displace a hotlist-backed expert. */
+    g_host_arena.slot_use[slot] = 0;
+    g_host_arena.index[(size_t)layer * g_host_arena.n_total_expert + expert] =
+        (int32_t)slot;
+    g_host_arena.admissions++;
+}
+
+/* One read staged through the shared pinned staging buffer rather than handed
+ * straight to the file descriptor: an arena entry is contiguous while the
+ * three tensors are not, and this keeps preload on the same O_DIRECT /
+ * page-cache decision as every other read. Preload is a one-time cost, so the
+ * extra copy never touches the token path. */
+static int cuda_host_arena_read_one(uint64_t file_offset, uint64_t bytes,
+                                    char *dst) {
+    const char *payload = NULL;
+    if (!cuda_model_stage_read(g_stream_selected_stage[0],
+                               g_stream_selected_stage_bytes,
+                               file_offset, bytes, &payload, 0)) {
+        return 0;
+    }
+    memcpy(dst, payload, (size_t)bytes);
+    return 1;
+}
+
+extern "C" int ds4_gpu_host_arena_configure(uint64_t bytes,
+                                            uint64_t gate_expert_bytes,
+                                            uint64_t down_expert_bytes) {
+    if (g_host_arena.enabled) return 1;
+    if (bytes == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    const uint64_t stride =
+        cuda_host_arena_stride(gate_expert_bytes, down_expert_bytes);
+    if (stride == 0 || bytes < stride) return 0;
+    if (bytes / stride > UINT32_MAX) bytes = (uint64_t)UINT32_MAX * stride;
+
+    /* Pinned memory is non-pageable: the kernel cannot reclaim it, which is
+     * exactly the guarantee a page cache cannot give. cudaMallocHost is page
+     * aligned, so entries stay usable as O_DIRECT targets later. */
+    void *base = NULL;
+    const cudaError_t err = cudaMallocHost(&base, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: host expert arena allocation of %.2f GiB failed: %s; "
+                "streaming without it\n",
+                (double)bytes / 1073741824.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const uint32_t max_slots = (uint32_t)(bytes / stride);
+    g_host_arena.base = (char *)base;
+    g_host_arena.capacity = (uint64_t)max_slots * stride;
+    g_host_arena.gate_bytes = gate_expert_bytes;
+    g_host_arena.down_bytes = down_expert_bytes;
+    g_host_arena.stride = stride;
+    g_host_arena.max_slots = max_slots;
+    g_host_arena.slot_off = (uint64_t *)calloc(max_slots, sizeof(uint64_t));
+    g_host_arena.slot_gate = (uint64_t *)calloc(max_slots, sizeof(uint64_t));
+    g_host_arena.slot_down = (uint64_t *)calloc(max_slots, sizeof(uint64_t));
+    g_host_arena.slot_layer = (uint32_t *)calloc(max_slots, sizeof(uint32_t));
+    g_host_arena.slot_expert = (uint32_t *)calloc(max_slots, sizeof(uint32_t));
+    g_host_arena.slot_use = (uint64_t *)calloc(max_slots, sizeof(uint64_t));
+    g_host_arena.slot_last_load = (uint64_t *)calloc(max_slots, sizeof(uint64_t));
+    if (!g_host_arena.slot_off || !g_host_arena.slot_gate ||
+        !g_host_arena.slot_down || !g_host_arena.slot_layer ||
+        !g_host_arena.slot_expert || !g_host_arena.slot_use ||
+        !g_host_arena.slot_last_load) {
+        cuda_host_arena_free();
+        return 0;
+    }
+    /* Every entry is the same size class, so a slot's offset is fixed and a
+     * victim's space can be reused without repacking. */
+    for (uint32_t s = 0; s < max_slots; s++) {
+        g_host_arena.slot_off[s] = (uint64_t)s * stride;
+    }
+    const char *admit = getenv("DS4_HOST_ARENA_ADMIT");
+    /* Runtime admission is off by default. It is a real mechanism with real
+     * counters, but measured against both a good and a deliberately stale
+     * hotlist it does not pay for itself: at 40 GiB the preload already covers
+     * the working set (neutral), and when the preload is wrong the copied-in
+     * tail churns and costs more than it recovers. Set DS4_HOST_ARENA_ADMIT=N
+     * to turn it on (admit an expert from its Nth fetch) while the read-into-
+     * arena redesign that would make admission free is worked out. */
+    const uint32_t threshold =
+        admit && admit[0] ? (uint32_t)strtoul(admit, NULL, 10) : 0u;
+    g_host_arena.admit_threshold = threshold == 0 ? UINT32_MAX : threshold;
+    g_host_arena.enabled = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_host_arena_seed(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t *expert_ids,
+        uint32_t n_experts) {
+    if (!g_host_arena.enabled || !table || !expert_ids || n_experts == 0) {
+        return 0;
+    }
+    if (table->layer >= DS4_CUDA_EXPERT_POOL_MAX_LAYERS) return 1;
+    if (!cuda_host_arena_index_ensure(table->n_total_expert)) return 0;
+
+    const uint64_t gate_b = table->gate_expert_bytes;
+    const uint64_t down_b = table->down_expert_bytes;
+    const uint64_t stride = cuda_host_arena_stride(gate_b, down_b);
+    const uint64_t max_tensor = gate_b > down_b ? gate_b : down_b;
+    const uint64_t stage_bytes =
+        max_tensor + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const int32_t expert = expert_ids[i];
+        if (expert < 0 || (uint32_t)expert >= table->n_total_expert) continue;
+        int32_t *slotp = &g_host_arena.index[
+            (size_t)table->layer * g_host_arena.n_total_expert +
+            (uint32_t)expert];
+        if (*slotp >= 0) continue;                 /* already resident */
+        const uint32_t slot = g_host_arena.slot_count;
+        if (slot >= g_host_arena.max_slots) break; /* full: the rest are colder */
+        const uint64_t off = g_host_arena.slot_off[slot];
+        if (stride > g_host_arena.capacity - off) break;
+
+        const uint64_t src[3] = {
+            table->gate_offset + (uint64_t)expert * gate_b,
+            table->up_offset   + (uint64_t)expert * gate_b,
+            table->down_offset + (uint64_t)expert * down_b,
+        };
+        const uint64_t size[3] = { gate_b, gate_b, down_b };
+        char *dst[3] = {
+            g_host_arena.base + off,
+            g_host_arena.base + off + gate_b,
+            g_host_arena.base + off + 2u * gate_b,
+        };
+        int ok = 1;
+        for (int k = 0; k < 3 && ok; k++) {
+            ok = cuda_host_arena_read_one(src[k], size[k], dst[k]);
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: host expert arena preload stopped at layer %u expert %d "
+                    "after %u experts; the rest stream as before\n",
+                    table->layer, expert, g_host_arena.slot_count);
+            break;
+        }
+        g_host_arena.slot_off[slot] = off;
+        g_host_arena.slot_gate[slot] = gate_b;
+        g_host_arena.slot_down[slot] = down_b;
+        g_host_arena.slot_layer[slot] = table->layer;
+        g_host_arena.slot_expert[slot] = (uint32_t)expert;
+        /* A preload prior: hotlist-backed entries start a few votes ahead of
+         * runtime admits, so adapting to the session cannot immediately evict
+         * the set the hotlist argued for. An admitted expert must earn its
+         * place with real hits before it displaces a preloaded one. */
+        g_host_arena.slot_use[slot] = 4u;
+        *slotp = (int32_t)slot;
+        g_host_arena.slot_count++;
+    }
+    return 1;
+}
+
+extern "C" void ds4_gpu_host_arena_set_admission(uint32_t threshold) {
+    /* The environment override wins so the A/B switches keep working. */
+    if (getenv("DS4_HOST_ARENA_ADMIT")) return;
+    g_host_arena.admit_threshold = threshold == 0 ? UINT32_MAX : threshold;
+}
+
+/* Resident experts and their byte footprint, for the profiler's RAM tier. */
+extern "C" void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->capacity_bytes = g_host_arena.enabled ? g_host_arena.capacity : 0;
+    /* Every entry is the nominal size class and slots are never freed, so the
+     * footprint is exactly the committed slot count times the stride. */
+    out->used_bytes = (uint64_t)g_host_arena.slot_count * g_host_arena.stride;
+    out->experts = g_host_arena.slot_count;
+    out->hits = g_host_arena.hits;
+    out->misses = g_host_arena.misses;
+    out->admissions = g_host_arena.admissions;
+    out->evictions = g_host_arena.evictions;
+    out->evicted_fetches = g_host_arena.evicted_fetches;
+}
+
+
+/* Keep the per-call expert table in one allocation. At 1024-token prefill the
+ * table is ~1.7 GiB; allocating gate, up and down separately leaves the
+ * allocator with no contiguous 672 MiB block for the down table even though
+ * cudaMemGetInfo still reports >1.5 GiB free. The slab is reused across calls
+ * and only grows when the selected-expert set grows. */
+static int cuda_stream_selected_host_attach(void **raw, void **dev, uint64_t bytes) {
+    void *h = NULL, *d = NULL;
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
+    if (cudaHostAlloc(&h, (size_t)bytes,
+                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(h);
+        return 0;
+    }
+    *raw = h;
+    *dev = d;
+    return 1;
+}
+
+static void cuda_stream_selected_host_detach(int *mapped, void **raw) {
+    if (*mapped && *raw) (void)cudaFreeHost(*raw);
+    *mapped = 0;
+    *raw = NULL;
+}
+
+/* Map a table pointer to its mapped-host backing and offset, or NULL when the
+ * range is device memory. H2D loads into a host range must use plain memcpy. */
+static void *cuda_stream_selected_host_target(const void *p, uint64_t *off) {
+    if (!p) return NULL;
+    const char *c = (const char *)p;
+    if (g_stream_selected_cache.gate_host_mapped &&
+        c >= g_stream_selected_cache.gate_ptr &&
+        c < g_stream_selected_cache.gate_ptr + g_stream_selected_cache.gate_capacity) {
+        if (off) *off = (uint64_t)(c - g_stream_selected_cache.gate_ptr);
+        return g_stream_selected_cache.gate_host_raw;
+    }
+    if (g_stream_selected_cache.up_host_mapped &&
+        c >= g_stream_selected_cache.up_ptr &&
+        c < g_stream_selected_cache.up_ptr + g_stream_selected_cache.up_capacity) {
+        if (off) *off = (uint64_t)(c - g_stream_selected_cache.up_ptr);
+        return g_stream_selected_cache.up_host_raw;
+    }
+    if (g_stream_selected_cache.down_host_mapped &&
+        c >= g_stream_selected_cache.down_ptr &&
+        c < g_stream_selected_cache.down_ptr + g_stream_selected_cache.down_capacity) {
+        if (off) *off = (uint64_t)(c - g_stream_selected_cache.down_ptr);
+        return g_stream_selected_cache.down_host_raw;
+    }
+    return NULL;
+}
+
+static int cuda_stream_selected_ensure_slab(uint64_t gate_bytes,
+                                            uint64_t up_bytes,
+                                            uint64_t down_bytes) {
+    if (gate_bytes == 0 || up_bytes == 0 || down_bytes == 0) return 0;
+    if (gate_bytes > UINT64_MAX - up_bytes ||
+        gate_bytes + up_bytes > UINT64_MAX - down_bytes) {
+        return 0;
+    }
+    if (g_stream_selected_cache.slab_owned &&
+        g_stream_selected_cache.gate_capacity >= gate_bytes &&
+        g_stream_selected_cache.up_capacity >= up_bytes &&
+        g_stream_selected_cache.down_capacity >= down_bytes) {
+        return 1;
+    }
+    if (g_stream_selected_cache.gate_ptr) {
+        if (g_stream_selected_cache.slab_owned) {
+            /* One device base covers gate/up (down may be the host alias). */
+            if (!g_stream_selected_cache.gate_host_mapped) {
+                (void)cudaFree(g_stream_selected_cache.gate_ptr);
+            }
+        } else {
+            if (!g_stream_selected_cache.gate_host_mapped &&
+                g_stream_selected_cache.gate_ptr) {
+                (void)cudaFree(g_stream_selected_cache.gate_ptr);
+            }
+            if (!g_stream_selected_cache.up_host_mapped &&
+                g_stream_selected_cache.up_ptr) {
+                (void)cudaFree(g_stream_selected_cache.up_ptr);
+            }
+            if (!g_stream_selected_cache.down_host_mapped &&
+                g_stream_selected_cache.down_ptr) {
+                (void)cudaFree(g_stream_selected_cache.down_ptr);
+            }
+        }
+    }
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.gate_host_mapped,
+                                     &g_stream_selected_cache.gate_host_raw);
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.up_host_mapped,
+                                     &g_stream_selected_cache.up_host_raw);
+    cuda_stream_selected_host_detach(&g_stream_selected_cache.down_host_mapped,
+                                     &g_stream_selected_cache.down_host_raw);
+    g_stream_selected_cache.gate_ptr = NULL;
+    g_stream_selected_cache.up_ptr = NULL;
+    g_stream_selected_cache.down_ptr = NULL;
+    g_stream_selected_cache.gate_capacity = 0;
+    g_stream_selected_cache.up_capacity = 0;
+    g_stream_selected_cache.down_capacity = 0;
+    g_stream_selected_cache.slab_owned = 0;
+
+    const uint64_t total = gate_bytes + up_bytes + down_bytes;
+    if (total > (uint64_t)SIZE_MAX) return 0;
+    void *base = NULL;
+    cudaError_t err = cudaMalloc(&base, (size_t)total);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (cuda_derived_cache_evict_only() != 0) {
+            err = cudaMalloc(&base, (size_t)total);
+        }
+    }
+    if (err != cudaSuccess) {
+        /* Spill levels, most VRAM first:
+         *   1. gate+up in VRAM, down in mapped host;
+         *   2. gate in VRAM, up+down in mapped host;
+         *   3. gate+up+down in mapped host.
+         * The kernels read host tables zero-copy over PCIe. Slower, but keeps
+         * 1024-token prefill exact at larger contexts instead of failing. */
+        void *gbase = NULL;
+        void *gdev = NULL, *udev = NULL, *ddev = NULL;
+        if (cudaMalloc(&gbase, (size_t)(gate_bytes + up_bytes)) == cudaSuccess &&
+            cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.down_host_raw, &ddev, down_bytes)) {
+            g_stream_selected_cache.gate_ptr = (char *)gbase;
+            g_stream_selected_cache.up_ptr = (char *)gbase + gate_bytes;
+            g_stream_selected_cache.down_ptr = (char *)ddev;
+            g_stream_selected_cache.gate_capacity = gate_bytes;
+            g_stream_selected_cache.up_capacity = up_bytes;
+            g_stream_selected_cache.down_capacity = down_bytes;
+            g_stream_selected_cache.slab_owned = 1;
+            g_stream_selected_cache.down_host_mapped = 1;
+            fprintf(stderr,
+                    "ds4: CUDA prefill staging: gate/up %.0f MiB in VRAM, "
+                    "down %.0f MiB in mapped host memory (slow path)\n",
+                    (double)(gate_bytes + up_bytes) / 1048576.0,
+                    (double)down_bytes / 1048576.0);
+            (void)cudaGetLastError();
+            return 1;
+        }
+        if (gbase) (void)cudaFree(gbase);
+        gbase = NULL;
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.down_host_mapped,
+                                         &g_stream_selected_cache.down_host_raw);
+        (void)cudaGetLastError();
+
+        if (cudaMalloc(&gbase, (size_t)gate_bytes) == cudaSuccess &&
+            cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.up_host_raw, &udev, up_bytes) &&
+            cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.down_host_raw, &ddev, down_bytes)) {
+            g_stream_selected_cache.gate_ptr = (char *)gbase;
+            g_stream_selected_cache.up_ptr = (char *)udev;
+            g_stream_selected_cache.down_ptr = (char *)ddev;
+            g_stream_selected_cache.gate_capacity = gate_bytes;
+            g_stream_selected_cache.up_capacity = up_bytes;
+            g_stream_selected_cache.down_capacity = down_bytes;
+            g_stream_selected_cache.slab_owned = 0;
+            g_stream_selected_cache.up_host_mapped = 1;
+            g_stream_selected_cache.down_host_mapped = 1;
+            fprintf(stderr,
+                    "ds4: CUDA prefill staging: gate %.0f MiB in VRAM, "
+                    "up+down %.0f MiB in mapped host memory (slow path)\n",
+                    (double)gate_bytes / 1048576.0,
+                    (double)(up_bytes + down_bytes) / 1048576.0);
+            (void)cudaGetLastError();
+            return 1;
+        }
+        if (gbase) (void)cudaFree(gbase);
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.up_host_mapped,
+                                         &g_stream_selected_cache.up_host_raw);
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.down_host_mapped,
+                                         &g_stream_selected_cache.down_host_raw);
+        (void)cudaGetLastError();
+
+        if (cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.gate_host_raw, &gdev, gate_bytes) &&
+            cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.up_host_raw, &udev, up_bytes) &&
+            cuda_stream_selected_host_attach(
+                    &g_stream_selected_cache.down_host_raw, &ddev, down_bytes)) {
+            g_stream_selected_cache.gate_ptr = (char *)gdev;
+            g_stream_selected_cache.up_ptr = (char *)udev;
+            g_stream_selected_cache.down_ptr = (char *)ddev;
+            g_stream_selected_cache.gate_capacity = gate_bytes;
+            g_stream_selected_cache.up_capacity = up_bytes;
+            g_stream_selected_cache.down_capacity = down_bytes;
+            g_stream_selected_cache.slab_owned = 0;
+            g_stream_selected_cache.gate_host_mapped = 1;
+            g_stream_selected_cache.up_host_mapped = 1;
+            g_stream_selected_cache.down_host_mapped = 1;
+            fprintf(stderr,
+                    "ds4: CUDA prefill staging: gate/up/down %.0f MiB in mapped "
+                    "host memory (slowest path)\n",
+                    (double)total / 1048576.0);
+            (void)cudaGetLastError();
+            return 1;
+        }
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.gate_host_mapped,
+                                         &g_stream_selected_cache.gate_host_raw);
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.up_host_mapped,
+                                         &g_stream_selected_cache.up_host_raw);
+        cuda_stream_selected_host_detach(&g_stream_selected_cache.down_host_mapped,
+                                         &g_stream_selected_cache.down_host_raw);
+
+        size_t free_b = 0, total_b = 0;
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr,
+                "ds4: CUDA prefill staging slab allocation failed for %.2f MiB "
+                "(gate %.2f + up %.2f + down %.2f; free %.2f GiB): %s\n",
+                (double)total / 1048576.0,
+                (double)gate_bytes / 1048576.0,
+                (double)up_bytes / 1048576.0,
+                (double)down_bytes / 1048576.0,
+                (double)free_b / 1073741824.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_stream_selected_cache.gate_ptr = (char *)base;
+    g_stream_selected_cache.up_ptr = (char *)base + gate_bytes;
+    g_stream_selected_cache.down_ptr = (char *)base + gate_bytes + up_bytes;
+    g_stream_selected_cache.gate_capacity = gate_bytes;
+    g_stream_selected_cache.up_capacity = up_bytes;
+    g_stream_selected_cache.down_capacity = down_bytes;
+    g_stream_selected_cache.slab_owned = 1;
+    return 1;
+}
+
 static int cuda_stream_selected_ensure_bytes(
         char **ptr, uint64_t *capacity, uint64_t bytes, const char *label) {
     if (*ptr && *capacity >= bytes) return 1;
@@ -26935,6 +28980,16 @@ static int cuda_stream_selected_ensure_bytes(
     }
     if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
     cudaError_t err = cudaMalloc((void **)ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        /* Shed only the rebuildable derived Q8 copies and retry. The resident
+         * expert pool is deliberately left alone here: begin_load latches
+         * pool_usable before this call and would otherwise dereference a pool
+         * dropped out from under it (use-after-free). */
+        (void)cudaGetLastError();
+        if (cuda_derived_cache_evict_only() != 0) {
+            err = cudaMalloc((void **)ptr, (size_t)bytes);
+        }
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA streaming %s allocation failed for %.2f MiB: %s\n",
                 label, (double)bytes / 1048576.0, cudaGetErrorString(err));
@@ -26980,15 +29035,135 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
+/* Copy one expert tensor between the compute device (tier 0, where the
+ * per-call table lives) and a pool tier. Extra tiers are only admitted when
+ * their peer path to tier 0 was validated, so a cross-tier copy is always a
+ * peer copy; same-tier stays a plain D2D. Executes on the selected upload
+ * stream, which belongs to tier 0. */
+static int cuda_expert_pool_copy(int src_tier, const void *src,
+                                 int dst_tier, void *dst, uint64_t bytes) {
+    cuda_expert_pool *p = &g_expert_pool;
+    const int sd = p->device[src_tier];
+    const int dd = p->device[dst_tier];
+    if (sd == dd) {
+        return cudaMemcpyAsync(dst, src, (size_t)bytes,
+                               cudaMemcpyDeviceToDevice,
+                               g_stream_selected_upload_stream) == cudaSuccess;
+    }
+    /* A peer copy uses both devices' PCIe/NVLink links: credit the receiver's
+     * inbound direction and the sender's outbound one, matching the H2D loads'
+     * tx=into / rx=out convention. */
+    prof_note_tx(dst_tier, bytes);
+    prof_note_rx(src_tier, bytes);
+    prof_note_weight(dst_tier, bytes);
+    /* The upload stream was created on the primary device, so the peer copy
+     * must be issued with that device current (not necessarily physical 0,
+     * e.g. --gpu-devices 1). Restore the caller's device afterwards. */
+    int cur = 0;
+    (void)cudaGetDevice(&cur);
+    (void)cudaSetDevice(p->device[0]);
+    const cudaError_t rc = cudaMemcpyPeerAsync(dst, dd, src, sd, (size_t)bytes,
+                                               g_stream_selected_upload_stream);
+    (void)cudaSetDevice(cur);
+    return rc == cudaSuccess;
+}
+
+/* Byte offset of a global slot inside its tier's slab, and the slab's base
+ * pointer for the requested tensor. */
+static uint32_t cuda_expert_pool_slot_local(const cuda_expert_pool *p,
+                                            int32_t slot) {
+    return (uint32_t)slot - p->slot_base[(int)p->slot_tier[slot]];
+}
+
+/*
+ * Phase-aware flush. The prefill working set and the decode resident pool
+ * compete for the same VRAM: prefill needs a table sized to the layer's
+ * unique experts (up to the whole expert set), decode needs the Least-Stale
+ * pool. Drop the one the incoming phase cannot use so neither has to fight
+ * the model arena for space. This is what keeps a big prefill from OOMing and
+ * frees the big prefill table before decode needs its pool.
+ */
+static int g_stream_phase;   /* 0 = none, 1 = prefill, 2 = decode */
+static void cuda_stream_phase_enter(int phase) {
+    if (phase == g_stream_phase) return;
+    if (phase == 1) {
+        /* Prefill: the decode-only resident pool is dead weight here. */
+        if (g_expert_pool.valid) cuda_expert_pool_drop();
+        if (getenv("DS4_CUDA_PHASE_TRACE")) {
+            fprintf(stderr, "ds4: phase -> prefill (decode pool flushed)\n");
+        }
+    } else if (phase == 2 && g_stream_phase == 1) {
+        /* Decode after prefill: the prefill table can be as large as the
+         * whole expert set; release it so the decode pool can claim that
+         * VRAM. It is rebuilt tiny (six experts) on the first decode load. */
+        cuda_stream_selected_cache_release();
+        if (getenv("DS4_CUDA_PHASE_TRACE")) {
+            fprintf(stderr, "ds4: phase -> decode (prefill table flushed)\n");
+        }
+    }
+    g_stream_phase = phase;
+}
+
+/* Transfer-event bookkeeping: a start is emitted when an expert is classified
+ * as needing a copy, the matching end when the next layer begins loading (by
+ * then the copies have completed, because the layer's compute consumed them). */
+static uint16_t g_pend_end_layer[256];
+static uint16_t g_pend_end_expert[256];
+static uint8_t  g_pend_end_dev[256];
+static int      g_pend_end_n;
+
+static void cuda_prof_flush_expert_ends(void) {
+    for (int i = 0; i < g_pend_end_n; i++)
+        ds4_profiler_trace_event(DS4_PEV_XFER_EXPERT_END,
+                                 g_pend_end_layer[i], g_pend_end_expert[i],
+                                 g_pend_end_dev[i], 0);
+    g_pend_end_n = 0;
+}
+
+static void cuda_prof_add_pending(uint16_t layer, uint16_t expert,
+                                  uint8_t dev) {
+    if (g_pend_end_n < (int)(sizeof(g_pend_end_layer) /
+                             sizeof(g_pend_end_layer[0]))) {
+        g_pend_end_layer[g_pend_end_n] = layer;
+        g_pend_end_expert[g_pend_end_n] = expert;
+        g_pend_end_dev[g_pend_end_n] = dev;
+        g_pend_end_n++;
+    }
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
-        uint32_t slot_count) {
+        uint32_t slot_count,
+        int allow_pool) {
+    /* Consume the CPU-expert set once, at entry, so an early return does not
+     * leave a stale set for the next load (which would make the engine add a
+     * CPU contribution for an expert the GPU also computed). */
+    const uint32_t cpu_count = g_cpu_expert_count;
+    g_cpu_expert_count = 0;
     cuda_stream_selected_cache_invalidate();
+    /* Events carry the tier that actually receives the data, so the trace is
+     * correct for any GPU (primary, cache tier, future third card). */
+    const uint8_t prof_dst = (uint8_t)(g_current_logical_tier < 0
+                                       ? 0 : g_current_logical_tier);
+    /* Close the previous layer's transfer events. By the time the next layer
+     * starts loading, every copy issued for the previous one has completed
+     * (that layer's compute depended on it), so this is the honest end of
+     * those transfers without adding a sync just for the profiler. */
+    cuda_prof_flush_expert_ends();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
         slot_count == 0) {
         return 0;
+    }
+    cuda_stream_phase_enter(slot_count == 6u ? 2 : 1);
+    /* Release any claim a previous layer left behind uncommitted (an aborted
+     * load) before this layer hands out slots; a slot mid-fill must never look
+     * free to a new claim. The epoch marks the slots this load reads, so the
+     * layer cannot evict one of its own uploads. */
+    if (g_host_arena.enabled) {
+        cuda_host_arena_reclaim_claims();
+        g_host_arena.load_epoch++;
     }
     /* Routing-stickiness instrumentation for decode (one selection per
      * layer per token): counts how many of the selected experts were also
@@ -27025,11 +29200,14 @@ static int cuda_stream_selected_cache_begin_load(
                     calls ? 100.0 * (double)hits / ((double)calls * slot_count) : 0.0);
         }
     }
-    if (g_n_gpus != 1) {
-        fprintf(stderr,
-                "ds4: CUDA SSD streaming requires single-GPU placement\n");
-        return 0;
-    }
+    /*
+     * Multi-GPU streaming is the expert-cache-tier path: the pool spans every
+     * configured device with a validated peer path to the primary, compute
+     * stays on tier 0, and a hit on a secondary tier is peer-copied into the
+     * tier-0 table. Tiers without a validated peer path are simply not
+     * admitted, so a 1-GPU or no-peer run degrades to the single-device path
+     * with no behavioral change.
+     */
 
     /*
      * Per-call compacted table: every selected expert is present in this
@@ -27048,62 +29226,70 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    const uint32_t resident_cap =
-        slot_count == 6u ? cuda_stream_resident_cap(table->layer,
-                              table->gate_expert_bytes + table->gate_expert_bytes +
-                              table->down_expert_bytes) : 0;
-    cuda_layer_resident_experts *r = NULL;
-    if (resident_cap != 0 && table->layer < DS4_CUDA_STREAM_RESIDENT_MAX_LAYERS) {
-        r = &g_layer_resident[table->layer];
-        if (!r->valid ||
-            r->n_total_expert != table->n_total_expert ||
-            r->gate_expert_bytes != table->gate_expert_bytes ||
-            r->down_expert_bytes != table->down_expert_bytes) {
-            cuda_layer_resident_release_one(r);
-            memset(r, 0, sizeof(*r));
-            r->valid = 1;
-            r->layer = table->layer;
-            r->n_total_expert = table->n_total_expert;
-            r->gate_expert_bytes = table->gate_expert_bytes;
-            r->down_expert_bytes = table->down_expert_bytes;
-            r->slots_cap = resident_cap;
-            r->expert_to_slot = (int32_t *)calloc(table->n_total_expert,
-                                                  sizeof(int32_t));
-            r->slot_to_expert = (int32_t *)malloc(resident_cap * sizeof(int32_t));
-            r->slot_token = (uint64_t *)malloc(resident_cap * sizeof(uint64_t));
-            if (!r->expert_to_slot || !r->slot_to_expert || !r->slot_token) {
-                cuda_layer_resident_release_one(r);
-                memset(r, 0, sizeof(*r));
-                r = NULL;
-            } else {
-                for (uint32_t i = 0; i < table->n_total_expert; i++) {
-                    r->expert_to_slot[i] = -1;
-                }
-                const uint64_t pool_bytes = (uint64_t)resident_cap *
-                    table->gate_expert_bytes;
-                const uint64_t pool_down = (uint64_t)resident_cap *
-                    table->down_expert_bytes;
-                if (cudaMalloc(&r->gate_ptr, pool_bytes) != cudaSuccess ||
-                    cudaMalloc(&r->up_ptr, pool_bytes) != cudaSuccess ||
-                    cudaMalloc(&r->down_ptr, pool_down) != cudaSuccess) {
-                    (void)cudaGetLastError();
-                    cuda_layer_resident_release_one(r);
-                    memset(r, 0, sizeof(*r));
-                    r = NULL;
-                } else {
-                    r->gate_capacity = pool_bytes;
-                    r->up_capacity = pool_bytes;
-                    r->down_capacity = pool_down;
-                }
+    if (getenv("DS4_CUDA_MEM_DIAG") != NULL && allow_pool && slot_count == 6u) {
+        static uint64_t s_diag_calls;
+        static int s_diag_prints;
+        s_diag_calls++;
+        if (s_diag_prints < 12 &&
+            (s_diag_calls == 1 || (s_diag_calls & (s_diag_calls - 1u)) == 0u)) {
+            s_diag_prints++;
+            size_t fb = 0, tb = 0;
+            (void)cudaMemGetInfo(&fb, &tb);
+            uint64_t arena_bytes = 0;
+            for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
+            size_t pool_reserved = 0;
+            cudaMemPool_t defpool = NULL;
+            int dev0 = 0;
+            (void)cudaGetDevice(&dev0);
+            if (cudaDeviceGetDefaultMemPool(&defpool, dev0) == cudaSuccess &&
+                defpool != NULL) {
+                (void)cudaMemPoolGetAttribute(defpool,
+                                              cudaMemPoolAttrReservedMemCurrent,
+                                              &pool_reserved);
             }
-        }
-        if (r && (uint32_t)table->layer + 1u > (uint32_t)g_stream_resident_layers_seen) {
-            g_stream_resident_layers_seen = (int)table->layer + 1;
+            uint64_t tensor_bytes = 0;
+            for (int gi = 0; gi < g_n_gpus; gi++) tensor_bytes += g_gpu[gi].used_bytes;
+            (void)cudaGetLastError();
+            fprintf(stderr,
+                    "ds4: MEMDIAG calls=%llu free=%.1fMiB tmp=%.1fMiB tt=%.1fMiB "
+                    "ranges=%.1f derived=%.1f q8f16=%.1f q8f32=%.1f "
+                    "ctxscratch=%.1f arenas=%.1f mempool=%.1f tensors=%.1f\n",
+                    (unsigned long long)s_diag_calls,
+                    (double)fb / 1048576.0,
+                    (double)g_cuda_tmp_bytes / 1048576.0,
+                    (double)g_tt_scratch_bytes / 1048576.0,
+                    (double)g_model_range_bytes / 1048576.0,
+                    (double)g_derived_artifact_bytes / 1048576.0,
+                    (double)g_q8_f16_bytes / 1048576.0,
+                    (double)g_q8_f32_bytes / 1048576.0,
+                    g_n_gpus > 0 ? (double)g_gpu[0].scratch_bytes / 1048576.0 : 0.0,
+                    (double)arena_bytes / 1048576.0,
+                    (double)pool_reserved / 1048576.0,
+                    (double)tensor_bytes / 1048576.0);
         }
     }
 
-    g_stream_resident_token++;
-    const uint64_t cur_token = g_stream_resident_token;
+    /*
+     * Global resident expert pool. Only single-token decode loads use it;
+     * batched prefill reads go straight to the per-call table. The pass
+     * counter advances at the first layer of each token, which is what
+     * Least-Stale uses to tell current experts from stale ones.
+     */
+    /* The pool is decode-only. The model arena loads non-routed weights
+     * lazily, so free VRAM at the first decode token is transiently high;
+     * wait until at least one full token has run before sizing the pool, or
+     * it would claim VRAM the arena is about to need. */
+    if (allow_pool && slot_count == 6u && table->layer == 0u) {
+        g_expert_pool.pass++;
+        g_expert_pool_tokens++;   /* survives pool drop/release */
+    }
+    int pool_usable =
+        allow_pool && slot_count == 6u &&
+        cuda_expert_pool_ensure(table->n_total_expert,
+                                table->gate_expert_bytes,
+                                table->down_expert_bytes,
+                                g_expert_pool.pass >= 2) != 0;
+    if (pool_usable) cuda_expert_pool_flush_stash();
 
     /*
      * Assign each selected expert a slot in the per-call table. Resident
@@ -27116,6 +29302,7 @@ static int cuda_stream_selected_cache_begin_load(
     } catch (...) {
         return 0;
     }
+    uint32_t cpu_used = 0;
     int ext_jobs = 0;
     for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert = selected_ids[i];
@@ -27125,50 +29312,200 @@ static int cuda_stream_selected_cache_begin_load(
                     expert, table->n_total_expert, table->layer);
             return 0;
         }
+        int is_cpu = 0;
+        ds4_profiler_trace_event(DS4_PEV_ROUTE, (uint16_t)table->layer,
+                                 (uint16_t)expert, 0, 0);
+        if (cpu_count != 0 && slot_count == 6u) {
+            for (uint32_t k = 0; k < cpu_count; k++) {
+                if (g_cpu_expert_ids[k] == expert) { is_cpu = 1; break; }
+            }
+        }
+        if (is_cpu) {
+            slot_ids[i] = 6;   /* shared zero slot; CPU adds the real result */
+            cpu_used = 1;
+            continue;
+        }
         int32_t tslot = table_slot_for[(uint32_t)expert];
         if (tslot < 0) {
             tslot = (int32_t)table_ids.size();
             table_slot_for[(uint32_t)expert] = tslot;
             table_ids.push_back(expert);
             pool_slot.push_back(-1);
-            if (r && r->expert_to_slot[(uint32_t)expert] >= 0) {
-                pool_slot[tslot] = r->expert_to_slot[(uint32_t)expert];
-                r->slot_token[(uint32_t)pool_slot[tslot]] = cur_token;
+            const int32_t pslot = pool_usable
+                ? cuda_expert_pool_lookup(table->layer, (uint32_t)expert) : -1;
+            if (pool_usable) {
+                g_expert_pool.stat_lookups++;
+                if (pslot >= 0) g_expert_pool.stat_hits++;
+            }
+            if (pslot >= 0) {
+                pool_slot[tslot] = pslot;
+                cuda_expert_pool_touch(pslot);
+                ds4_profiler_trace_event(
+                        DS4_PEV_CACHE_IN, (uint16_t)table->layer,
+                        (uint16_t)expert, prof_dst,
+                        (uint32_t)(table->gate_expert_bytes * 2u +
+                                   table->down_expert_bytes));
+                ds4_profiler_trace_expert(
+                        (uint16_t)table->layer, (uint16_t)expert,
+                        DS4_PTRACE_SRC_POOL,
+                        (uint8_t)(pslot >= 0 ? g_expert_pool.slot_tier[pslot] : 0xFF),
+                        prof_dst,
+                        (uint32_t)(table->gate_expert_bytes * 2u +
+                                   table->down_expert_bytes));
             } else {
+                /* This expert is read from host storage into the page cache;
+                 * count it as resident in RAM for the profiler. */
+                cuda_host_expert_mark(table->layer, (uint32_t)expert,
+                                      table->n_total_expert);
+                ds4_profiler_trace_event(
+                        DS4_PEV_XFER_EXPERT_START, (uint16_t)table->layer,
+                        (uint16_t)expert, prof_dst,
+                        (uint32_t)(table->gate_expert_bytes * 2u +
+                                   table->down_expert_bytes));
+                ds4_profiler_trace_expert(
+                        (uint16_t)table->layer, (uint16_t)expert,
+                        DS4_PTRACE_SRC_ARENA, 0xFF, prof_dst,
+                        (uint32_t)(table->gate_expert_bytes * 2u +
+                                   table->down_expert_bytes));
+                cuda_prof_add_pending((uint16_t)table->layer, (uint16_t)expert,
+                                      prof_dst);
                 ext_jobs++;
             }
         }
         slot_ids[i] = tslot;
     }
-    if (table_ids.empty() || table_ids.size() > UINT32_MAX) return 0;
+
+    /*
+     * In-place fast path: when every decode expert is already resident on the
+     * compute tier, the MoE can read the pool's tier-0 slabs directly instead
+     * of D2D-copying six experts into a throwaway per-call table. A tier-0
+     * slot's local index equals its global index, so the existing slot-id
+     * indirection already addresses the right slab row; publishing the slab
+     * pointers and remapping the ids is all that is needed. Misses and
+     * peer-tier hits still take the table path below, so correctness does not
+     * depend on this optimization.
+     */
+    /* Prefill's spilled down table must not serve decode: free it so decode
+     * uses the resident pool or a small device table instead. */
+    if (slot_count == 6u && (g_stream_selected_cache.down_host_mapped || g_stream_selected_cache.up_host_mapped || g_stream_selected_cache.gate_host_mapped)) {
+        cuda_stream_selected_cache_release();
+    }
+    if (slot_count == 6u && pool_usable && cpu_used == 0 &&
+        getenv("DS4_CUDA_DISABLE_POOL_INPLACE") == NULL &&
+        g_expert_pool.gate_ptr[0] && g_expert_pool.up_ptr[0] &&
+        g_expert_pool.down_ptr[0]) {
+        int all_tier0 = 1;
+        for (uint32_t i = 0; i < slot_count && all_tier0; i++) {
+            const int32_t ps = pool_slot[(uint32_t)slot_ids[i]];
+            if (ps < 0 || g_expert_pool.slot_tier[ps] != 0) all_tier0 = 0;
+        }
+        if (all_tier0) {
+            if (!g_stream_selected_cache.aliased) {
+                cuda_stream_selected_cache_release();  /* drop any old table */
+            }
+            if (ds4_gpu_set_current_device(0) != 0 ||
+                !cuda_stream_selected_ensure_i32(slot_count)) {
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            for (uint32_t i = 0; i < slot_count; i++) {
+                slot_ids[i] = pool_slot[(uint32_t)slot_ids[i]];
+            }
+            if (cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
+                           slot_ids.data(),
+                           (size_t)slot_count * sizeof(int32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            g_stream_selected_cache.gate_ptr = g_expert_pool.gate_ptr[0];
+            g_stream_selected_cache.up_ptr = g_expert_pool.up_ptr[0];
+            g_stream_selected_cache.down_ptr = g_expert_pool.down_ptr[0];
+            g_stream_selected_cache.gate_capacity = g_expert_pool.gate_capacity[0];
+            g_stream_selected_cache.up_capacity = g_expert_pool.up_capacity[0];
+            g_stream_selected_cache.down_capacity = g_expert_pool.down_capacity[0];
+            g_stream_selected_cache.aliased = 1;
+            g_stream_selected_cache.logical_tier = 0;
+            g_stream_selected_cache.model_map = table->model_map;
+            g_stream_selected_cache.layer = table->layer;
+            g_stream_selected_cache.n_total_expert = table->n_total_expert;
+            g_stream_selected_cache.slot_count = slot_count;
+            g_stream_selected_cache.compact_count = g_expert_pool.slot_cap[0];
+            g_stream_selected_cache.gate_offset = table->gate_offset;
+            g_stream_selected_cache.up_offset = table->up_offset;
+            g_stream_selected_cache.down_offset = table->down_offset;
+            g_stream_selected_cache.gate_expert_bytes = table->gate_expert_bytes;
+            g_stream_selected_cache.down_expert_bytes = table->down_expert_bytes;
+            g_stream_selected_cache.slot_selected_tensor.ptr =
+                g_stream_selected_cache.slot_selected_ptr;
+            g_stream_selected_cache.slot_selected_tensor.bytes =
+                (uint64_t)slot_count * sizeof(int32_t);
+            g_stream_selected_cache.slot_selected_tensor.owner = 0;
+            g_stream_selected_cache.slot_selected_tensor.device_id = 0;
+            g_stream_selected_cache.valid = 1;
+            if (getenv("DS4_CUDA_STREAM_TRACE") != NULL) {
+                fprintf(stderr, "ds4: stream trace layer %u inplace\n", table->layer);
+            }
+            return 1;
+        }
+    }
+
+    if (table_ids.size() > UINT32_MAX) return 0;
+    if (table_ids.empty() && !cpu_used) return 0;
     const uint64_t table_count = table_ids.size();
-    if (table_count > UINT64_MAX / table->gate_expert_bytes ||
-        table_count > UINT64_MAX / table->down_expert_bytes) {
+    /* Decode reserves one extra trailing slot as the shared zero expert. */
+    const uint64_t alloc_count = (slot_count == 6u) ? 7u : table_count;
+    if (alloc_count > UINT64_MAX / table->gate_expert_bytes ||
+        alloc_count > UINT64_MAX / table->down_expert_bytes) {
         return 0;
     }
-    const uint64_t table_gate_bytes = table_count * table->gate_expert_bytes;
-    const uint64_t table_down_bytes = table_count * table->down_expert_bytes;
+    const uint64_t table_gate_bytes = alloc_count * table->gate_expert_bytes;
+    const uint64_t table_down_bytes = alloc_count * table->down_expert_bytes;
     const int logical_tier = 0;
-    if (g_stream_selected_cache.logical_tier != logical_tier &&
-        g_stream_selected_cache.slot_selected_ptr) {
+    if (g_stream_selected_cache.aliased ||
+        (g_stream_selected_cache.logical_tier != logical_tier &&
+         g_stream_selected_cache.slot_selected_ptr)) {
         cuda_stream_selected_cache_release();
     }
     if (ds4_gpu_set_current_device(logical_tier) != 0 ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
-                table_gate_bytes, "gate experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
-                table_gate_bytes, "up experts") ||
-        !cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
-                table_down_bytes, "down experts") ||
+        !cuda_stream_selected_ensure_slab(
+                table_gate_bytes, table_gate_bytes, table_down_bytes) ||
         !cuda_stream_selected_ensure_i32(slot_count)) {
         cuda_stream_selected_cache_invalidate();
         return 0;
+    }
+    /* With the down table in host memory, pool-to-table D2D copies would need
+     * a D2H path; skip the pool and stream this layer's misses instead. */
+    if (g_stream_selected_cache.down_host_mapped || g_stream_selected_cache.up_host_mapped || g_stream_selected_cache.gate_host_mapped) pool_usable = 0;
+
+    /* Defensive: if a relief pass dropped the pool after pool_usable was
+     * latched, the pool_slot[] entries below point at freed slots. Fall back
+     * to the caller instead of reading them. */
+    if (pool_usable && !g_expert_pool.valid) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+
+    /* The shared zero expert is never written by a real expert, but re-zero
+     * it whenever the CPU set is in use so the GPU product for a CPU expert
+     * is exactly zero (the engine supplies the real contribution). */
+    if (cpu_used) {
+        const uint64_t zoff = 6ull * table->gate_expert_bytes;
+        const uint64_t zdoff = 6ull * table->down_expert_bytes;
+        if (cudaMemsetAsync(g_stream_selected_cache.gate_ptr + zoff, 0,
+                            (size_t)table->gate_expert_bytes,
+                            g_stream_selected_upload_stream) != cudaSuccess ||
+            cudaMemsetAsync(g_stream_selected_cache.up_ptr + zoff, 0,
+                            (size_t)table->gate_expert_bytes,
+                            g_stream_selected_upload_stream) != cudaSuccess ||
+            cudaMemsetAsync(g_stream_selected_cache.down_ptr + zdoff, 0,
+                            (size_t)table->down_expert_bytes,
+                            g_stream_selected_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
     }
 
     /*
@@ -27195,24 +29532,77 @@ static int cuda_stream_selected_cache_begin_load(
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
+        /* Runtime admission for this layer: at most one claim per missing
+         * expert, committed only after every read in the layer has landed. */
+        struct {
+            uint32_t slot;
+            int32_t  expert;
+        } pending[16];
+        uint32_t n_pending = 0;
+        const int admit_ok = slot_count == 6u && g_host_arena.enabled &&
+                             g_host_arena.admit_threshold != UINT32_MAX;
+
         for (uint32_t t = 0; t < table_count; t++) {
             if (pool_slot[t] >= 0) continue;
             const int32_t expert = table_ids[t];
+            /* An arena-resident expert is published as a pointer, so the
+             * upload DMA reads host memory instead of the file. The counters
+             * split the host-fetch set by where the bytes actually came from,
+             * which is what makes eviction/shortfall visible. */
+            const char *agate = NULL, *aup = NULL, *adown = NULL;
+            char *admit_gate = NULL, *admit_up = NULL, *admit_down = NULL;
+            if (cuda_host_arena_resolve(table->layer, (uint32_t)expert,
+                                        table->gate_expert_bytes,
+                                        table->down_expert_bytes,
+                                        &agate, &aup, &adown)) {
+                g_host_arena.hits++;
+            } else {
+                g_host_arena.misses++;
+                /* A fetch of an expert the arena once held and dropped is the
+                 * visible cost of eviction: the "swapped out" signal. */
+                if (g_host_arena.ever_evicted &&
+                    (uint32_t)expert < g_host_arena.n_total_expert &&
+                    table->layer < DS4_CUDA_EXPERT_POOL_MAX_LAYERS) {
+                    const size_t key = (size_t)table->layer *
+                        g_host_arena.n_total_expert + (uint32_t)expert;
+                    if (g_host_arena.ever_evicted[key]) {
+                        g_host_arena.evicted_fetches++;
+                    }
+                }
+                /* Claim a slot; the read workers fill it while they read, so
+                 * the next fetch of this expert is a hit at no extra cost. */
+                uint32_t claim = UINT32_MAX;
+                if (admit_ok && n_pending < 16u &&
+                    cuda_host_arena_reserve(table->layer, (uint32_t)expert,
+                                            table->gate_expert_bytes,
+                                            table->down_expert_bytes, &claim)) {
+                    const uint64_t off = g_host_arena.slot_off[claim];
+                    admit_gate = g_host_arena.base + off;
+                    admit_up = admit_gate + table->gate_expert_bytes;
+                    admit_down = admit_gate + 2u * table->gate_expert_bytes;
+                    pending[n_pending].slot = claim;
+                    pending[n_pending].expert = expert;
+                    n_pending++;
+                }
+            }
             jobs.push_back({0, table->gate_offset +
                                 (uint64_t)expert * table->gate_expert_bytes,
                             table->gate_expert_bytes, NULL, 0, 0, NULL,
                             g_stream_selected_cache.gate_ptr,
-                            (uint64_t)t * table->gate_expert_bytes, 0});
+                            (uint64_t)t * table->gate_expert_bytes, 0, agate,
+                            admit_gate});
             jobs.push_back({0, table->up_offset +
                                 (uint64_t)expert * table->gate_expert_bytes,
                             table->gate_expert_bytes, NULL, 0, 0, NULL,
                             g_stream_selected_cache.up_ptr,
-                            (uint64_t)t * table->gate_expert_bytes, 0});
+                            (uint64_t)t * table->gate_expert_bytes, 0, aup,
+                            admit_up});
             jobs.push_back({0, table->down_offset +
                                 (uint64_t)expert * table->down_expert_bytes,
                             table->down_expert_bytes, NULL, 0, 0, NULL,
                             g_stream_selected_cache.down_ptr,
-                            (uint64_t)t * table->down_expert_bytes, 0});
+                            (uint64_t)t * table->down_expert_bytes, 0, adown,
+                            admit_down});
         }
 
         const size_t n_jobs = jobs.size();
@@ -27258,6 +29648,7 @@ static int cuda_stream_selected_cache_begin_load(
              * this covers the fallback pread path). */
             if (g_stream_keep_expert_cache == 0) {
                 for (int i = 0; i < npj; i++) {
+                    if (pj[i].arena) continue;   /* no storage read to drop */
                     cuda_model_drop_file_pages(pj[i].offset, pj[i].bytes);
                     cuda_model_discard_source_pages(table->model_map,
                                                     table->model_size,
@@ -27267,7 +29658,15 @@ static int cuda_stream_selected_cache_begin_load(
             }
             /* Async H2D copies of this wave's preads. */
             for (int i = 0; i < npj; i++) {
-                if (cudaMemcpyAsync(pj[i].dst + pj[i].dst_off,
+                prof_note_tx(0, pj[i].bytes);
+                prof_note_weight(0, pj[i].bytes);
+                char *dst = (char *)pj[i].dst + pj[i].dst_off;
+                uint64_t hoff = 0;
+                void *hraw = cuda_stream_selected_host_target(dst, &hoff);
+                if (hraw) {
+                    memcpy((char *)hraw + hoff, pj[i].payload,
+                           (size_t)pj[i].bytes);
+                } else if (cudaMemcpyAsync(dst,
                                     pj[i].payload, (size_t)pj[i].bytes,
                                     cudaMemcpyHostToDevice,
                                     g_stream_selected_upload_stream)
@@ -27289,13 +29688,17 @@ static int cuda_stream_selected_cache_begin_load(
                 }
             }
         }
-        if (cudaStreamSynchronize(g_stream_selected_upload_stream) != cudaSuccess) {
-            (void)cudaGetLastError();
-            cuda_stream_selected_cache_invalidate();
-            return 0;
-        }
         if (getenv("DS4_CUDA_STREAM_TRACE") != NULL) {
             fprintf(stderr, "ds4: stream trace wave uploads done\n");
+        }
+        /* Every read in the layer landed, so each claimed arena slot holds a
+         * complete expert. Publish them together; an aborted layer leaves its
+         * claims reclaimable and unindexed, never half-served. */
+        for (uint32_t i = 0; i < n_pending; i++) {
+            cuda_host_arena_commit(table->layer, (uint32_t)pending[i].expert,
+                                   pending[i].slot,
+                                   table->gate_expert_bytes,
+                                   table->down_expert_bytes);
         }
     }
 
@@ -27304,38 +29707,33 @@ static int cuda_stream_selected_cache_begin_load(
      * upload stream, after the miss H2D copies above.
      */
     int d2d_ok = 1;
-    if (r && r->gate_ptr) {
+    if (pool_usable) {
         for (uint32_t t = 0; t < table_count; t++) {
             if (pool_slot[t] < 0) continue;
             const uint32_t slot = (uint32_t)pool_slot[t];
-            const uint64_t gate_off = (uint64_t)slot * table->gate_expert_bytes;
-            const uint64_t down_off = (uint64_t)slot * table->down_expert_bytes;
-            if (cudaMemcpyAsync(g_stream_selected_cache.gate_ptr +
-                                    (uint64_t)t * table->gate_expert_bytes,
-                                r->gate_ptr + gate_off,
-                                (size_t)table->gate_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess ||
-                cudaMemcpyAsync(g_stream_selected_cache.up_ptr +
-                                    (uint64_t)t * table->gate_expert_bytes,
-                                r->up_ptr + gate_off,
-                                (size_t)table->gate_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess ||
-                cudaMemcpyAsync(g_stream_selected_cache.down_ptr +
-                                    (uint64_t)t * table->down_expert_bytes,
-                                r->down_ptr + down_off,
-                                (size_t)table->down_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess) {
+            const int tier = (int)g_expert_pool.slot_tier[slot];
+            const uint32_t local = cuda_expert_pool_slot_local(&g_expert_pool, (int32_t)slot);
+            const uint64_t gate_off = (uint64_t)local * table->gate_expert_bytes;
+            const uint64_t down_off = (uint64_t)local * table->down_expert_bytes;
+            if (!cuda_expert_pool_copy(tier,
+                        g_expert_pool.gate_ptr[tier] + gate_off, 0,
+                        g_stream_selected_cache.gate_ptr +
+                            (uint64_t)t * table->gate_expert_bytes,
+                        table->gate_expert_bytes) ||
+                !cuda_expert_pool_copy(tier,
+                        g_expert_pool.up_ptr[tier] + gate_off, 0,
+                        g_stream_selected_cache.up_ptr +
+                            (uint64_t)t * table->gate_expert_bytes,
+                        table->gate_expert_bytes) ||
+                !cuda_expert_pool_copy(tier,
+                        g_expert_pool.down_ptr[tier] + down_off, 0,
+                        g_stream_selected_cache.down_ptr +
+                            (uint64_t)t * table->down_expert_bytes,
+                        table->down_expert_bytes)) {
                 (void)cudaGetLastError();
                 d2d_ok = 0;
                 break;
             }
-        }
-        if (d2d_ok && cudaStreamSynchronize(g_stream_selected_upload_stream) != cudaSuccess) {
-            d2d_ok = 0;
-            (void)cudaGetLastError();
         }
     }
 
@@ -27346,60 +29744,73 @@ static int cuda_stream_selected_cache_begin_load(
      * The upload into the pool is a D2D copy of the same data, cheaper
      * than a second host read.
      */
-    if (d2d_ok && r && r->gate_ptr) {
+    if (d2d_ok && pool_usable) {
         for (uint32_t t = 0; t < table_count; t++) {
             if (pool_slot[t] >= 0) continue;
             const int32_t expert = table_ids[t];
-            uint32_t evict = r->slots_used;
-            if (evict >= r->slots_cap) {
-                evict = r->slots_cap;
-                for (uint32_t s = 0; s < r->slots_cap; s++) {
-                    if (r->slot_token[s] != cur_token) {
-                        if (evict >= r->slots_cap ||
-                            r->slot_token[s] < r->slot_token[evict]) {
-                            evict = s;
-                        }
-                    }
-                }
-                if (evict >= r->slots_cap) {
-                    continue;   /* pool full of current-token slots */
-                }
-                r->expert_to_slot[r->slot_to_expert[evict]] = -1;
-            } else {
-                r->slots_used = evict + 1;
-            }
-            r->expert_to_slot[(uint32_t)expert] = (int32_t)evict;
-            r->slot_to_expert[evict] = expert;
-            r->slot_token[evict] = cur_token;
-            pool_slot[t] = (int32_t)evict;
-            const uint64_t gate_off = (uint64_t)evict * table->gate_expert_bytes;
-            const uint64_t down_off = (uint64_t)evict * table->down_expert_bytes;
-            if (cudaMemcpyAsync(r->gate_ptr + gate_off,
-                                g_stream_selected_cache.gate_ptr +
-                                    (uint64_t)t * table->gate_expert_bytes,
-                                (size_t)table->gate_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess ||
-                cudaMemcpyAsync(r->up_ptr + gate_off,
-                                g_stream_selected_cache.up_ptr +
-                                    (uint64_t)t * table->gate_expert_bytes,
-                                (size_t)table->gate_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess ||
-                cudaMemcpyAsync(r->down_ptr + down_off,
-                                g_stream_selected_cache.down_ptr +
-                                    (uint64_t)t * table->down_expert_bytes,
-                                (size_t)table->down_expert_bytes,
-                                cudaMemcpyDeviceToDevice,
-                                g_stream_selected_upload_stream) != cudaSuccess) {
+            const int32_t slot =
+                cuda_expert_pool_admit(table->layer, (uint32_t)expert,
+                                       table->layer, 0);
+            if (slot < 0) continue;
+            pool_slot[t] = slot;
+            const int tier = (int)g_expert_pool.slot_tier[slot];
+            const uint32_t local = cuda_expert_pool_slot_local(&g_expert_pool, slot);
+            const uint64_t gate_off = (uint64_t)local * table->gate_expert_bytes;
+            const uint64_t down_off = (uint64_t)local * table->down_expert_bytes;
+            if (!cuda_expert_pool_copy(0,
+                        g_stream_selected_cache.gate_ptr +
+                            (uint64_t)t * table->gate_expert_bytes, tier,
+                        g_expert_pool.gate_ptr[tier] + gate_off,
+                        table->gate_expert_bytes) ||
+                !cuda_expert_pool_copy(0,
+                        g_stream_selected_cache.up_ptr +
+                            (uint64_t)t * table->gate_expert_bytes, tier,
+                        g_expert_pool.up_ptr[tier] + gate_off,
+                        table->gate_expert_bytes) ||
+                !cuda_expert_pool_copy(0,
+                        g_stream_selected_cache.down_ptr +
+                            (uint64_t)t * table->down_expert_bytes, tier,
+                        g_expert_pool.down_ptr[tier] + down_off,
+                        table->down_expert_bytes)) {
                 (void)cudaGetLastError();
                 d2d_ok = 0;
                 break;
             }
         }
-        if (d2d_ok && cudaStreamSynchronize(g_stream_selected_upload_stream) != cudaSuccess) {
+    }
+    /* One stream sync per layer: orders the miss uploads, peer copies and
+     * promotions before the compute kernels read the table, and surfaces any
+     * async copy error. (Previously up to three syncs per layer.) */
+    if (d2d_ok) {
+        const uint64_t w0 = prof_now_ns();
+        const cudaError_t se = cudaStreamSynchronize(g_stream_selected_upload_stream);
+        const uint64_t wdt = prof_now_ns() - w0;
+        g_prof_device_wait_ns += wdt;
+        g_prof_upload_wait_ns += wdt;
+        ds4_profiler_note_step(DS4_PSTEP_WAIT_UPLOAD, wdt, 1, 0);
+        for (size_t t = 0; t < table_ids.size(); t++) {
+            if (pool_slot[t] >= 0) continue;
+            ds4_profiler_trace_event(
+                    DS4_PEV_XFER_EXPERT_END, (uint16_t)table->layer,
+                    (uint16_t)table_ids[t], prof_dst,
+                    (uint32_t)(table->gate_expert_bytes * 2u +
+                               table->down_expert_bytes));
+        }
+        if (se != cudaSuccess) {
             d2d_ok = 0;
             (void)cudaGetLastError();
+        }
+    }
+    if (d2d_ok) {
+        /* Every external expert of this layer has landed: close its transfer
+         * event so the timeline shows how long the wait actually was. */
+        for (size_t t = 0; t < table_ids.size(); t++) {
+            if (pool_slot[t] >= 0) continue;
+            ds4_profiler_trace_event(
+                    DS4_PEV_XFER_EXPERT_END, (uint16_t)table->layer,
+                    (uint16_t)table_ids[t], prof_dst,
+                    (uint32_t)(table->gate_expert_bytes * 2u +
+                               table->down_expert_bytes));
         }
     }
     if (!d2d_ok) {
@@ -27424,7 +29835,8 @@ static int cuda_stream_selected_cache_begin_load(
     g_stream_selected_cache.layer = table->layer;
     g_stream_selected_cache.n_total_expert = table->n_total_expert;
     g_stream_selected_cache.slot_count = slot_count;
-    g_stream_selected_cache.compact_count = (uint32_t)table_count;
+    g_stream_selected_cache.compact_count =
+        cpu_used ? 7u : (uint32_t)table_count;
     g_stream_selected_cache.gate_offset = table->gate_offset;
     g_stream_selected_cache.up_offset = table->up_offset;
     g_stream_selected_cache.down_offset = table->down_offset;
@@ -32796,6 +35208,7 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
         return 0;
     }
+    if (n_selected == 6u) cuda_stream_phase_enter(2);   /* decode */
     std::vector<int32_t> ids;
     try {
         ids.resize(n_selected);
@@ -32808,7 +35221,8 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
-    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected);
+    return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected,
+                                                 1);
 }
 
 __global__ static void glm_value_project_q8_0_batch_heads_kernel(
@@ -33437,16 +35851,109 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    if (n_selected == 6u) cuda_stream_phase_enter(2);   /* decode */
     return cuda_stream_selected_cache_begin_load(table, selected_ids,
-                                                 n_selected);
+                                                 n_selected, 1);
+}
+
+/*
+ * Load one expert's gate/up/down weights from the GGUF into a pool slot. Used
+ * only to preload the hotlist at startup; runtime misses are promoted from
+ * the per-call table with D2D copies instead.
+ */
+static int cuda_expert_pool_seed_one(const ds4_gpu_stream_expert_table *table,
+                                     uint32_t expert, int32_t slot) {
+    cuda_expert_pool *p = &g_expert_pool;
+    const uint64_t max_tensor = table->gate_expert_bytes > table->down_expert_bytes
+        ? table->gate_expert_bytes : table->down_expert_bytes;
+    const uint64_t stage_bytes = max_tensor +
+        (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+
+    const uint64_t offsets[3] = {
+        table->gate_offset + (uint64_t)expert * table->gate_expert_bytes,
+        table->up_offset   + (uint64_t)expert * table->gate_expert_bytes,
+        table->down_offset + (uint64_t)expert * table->down_expert_bytes,
+    };
+    const uint64_t sizes[3] = {
+        table->gate_expert_bytes, table->gate_expert_bytes,
+        table->down_expert_bytes,
+    };
+    const int tier = (int)p->slot_tier[slot];
+    const uint32_t local = cuda_expert_pool_slot_local(p, slot);
+    char *dst[3] = {
+        p->gate_ptr[tier] + (uint64_t)local * p->gate_expert_bytes,
+        p->up_ptr[tier]   + (uint64_t)local * p->gate_expert_bytes,
+        p->down_ptr[tier] + (uint64_t)local * p->down_expert_bytes,
+    };
+    const cudaStream_t st =
+        (tier < g_n_gpus && g_gpu[tier].stream)
+            ? (cudaStream_t)g_gpu[tier].stream
+            : g_stream_selected_upload_stream;
+
+    cuda_pread_job jobs[3];
+    for (int i = 0; i < 3; i++) {
+        jobs[i] = (cuda_pread_job) {
+            0, offsets[i], sizes[i], g_stream_selected_stage[i],
+            g_stream_selected_stage_bytes,
+            g_stream_keep_expert_cache != 0, NULL, NULL, 0, 0, NULL, NULL
+        };
+    }
+    if (!cuda_pread_pool_run(jobs, 3)) return 0;
+    int ok = 1;
+    WITH_DEVICE(p->device[tier]) {
+        for (int i = 0; i < 3 && ok; i++) {
+            prof_note_tx(tier, sizes[i]);
+            prof_note_weight(tier, sizes[i]);
+            if (cudaMemcpyAsync(dst[i], jobs[i].payload, (size_t)sizes[i],
+                                cudaMemcpyHostToDevice, st) != cudaSuccess) {
+                (void)cudaGetLastError();
+                ok = 0;
+            }
+        }
+        if (ok) {
+            const uint64_t w0 = prof_now_ns();
+            const cudaError_t se = cudaStreamSynchronize(st);
+            g_prof_device_wait_ns += prof_now_ns() - w0;
+            if (se != cudaSuccess) {
+                (void)cudaGetLastError();
+                ok = 0;
+            }
+        }
+    }
+    if (ok) cuda_host_expert_mark(table->layer, expert, table->n_total_expert);
+    return ok;
+}
+
+/* Prospective total pool capacity across all tiers, before allocation. The
+ * engine sizes its hotlist preload from this so experts are seeded directly
+ * into whichever tier (primary or an extra GPU) has room for them. */
+static uint32_t cuda_expert_pool_prospective_cap(uint64_t per_expert) {
+    cuda_expert_pool_env_read_once();
+    if (g_expert_pool_cap == 0) return 0;
+    (void)cudaSetDevice(0);
+    uint32_t total = cuda_expert_pool_choose_cap(per_expert);
+    const int tiers = cuda_expert_pool_tier_count();
+    for (int t = 1; t < tiers; t++) {
+        if (!g_gpu_peer_ok[t][0]) continue;
+        if (cudaSetDevice(g_gpu[t].device_id) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        total += cuda_expert_pool_auto_cap(per_expert);
+    }
+    (void)cudaSetDevice(0);
+    return total;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    (void)gate_expert_bytes;
-    (void)down_expert_bytes;
-    return 0;
+    if (gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2u) return 0;
+    /* Return the prospective capacity for auto too: the engine then loads the
+     * hotlist and calls seed_experts, which stashes the list until the pool is
+     * allowed to allocate after the arena has settled. */
+    return cuda_expert_pool_prospective_cap(gate_expert_bytes * 2u + down_expert_bytes);
 }
 
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -33539,6 +36046,11 @@ extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
     return 0;
 }
 
+/* Metal fuses RoPE into the fp8 raw-KV store; CUDA keeps the two steps. */
+extern "C" int ds4_gpu_kv_rope_fp8_fuse_available(void) {
+    return 0;
+}
+
 extern "C" int ds4_gpu_preload_q4_expert_tables(
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -33560,7 +36072,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) {
         cuda_stream_selected_cache_release();
-        cuda_layer_resident_release_all();
+        cuda_expert_pool_release();
     }
 }
 
@@ -33573,16 +36085,143 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
+    g_stream_expert_bytes = bytes;
+}
+
+/* Fill pool slots from a priority-ordered expert list. A fill-only admission
+ * never evicts an already-resident (hotter) expert. Seeding is a pure speed
+ * cache, so read/allocation failures degrade to per-token streaming rather
+ * than failing the run. */
+typedef struct {
+    int      valid;
+    ds4_gpu_stream_expert_table table;
+    uint32_t n;
+    int32_t  ids[256];
+} cuda_expert_stash;
+
+static cuda_expert_stash g_expert_stash[DS4_CUDA_EXPERT_POOL_MAX_LAYERS];
+static int g_expert_stash_flushed;
+
+/* Load the stashed hotlist into the pool once it exists. Called right after
+ * the auto pool allocates, so the hottest experts are resident from the first
+ * decode token instead of warming up dynamically. */
+static void cuda_expert_pool_flush_stash(void) {
+    if (g_expert_stash_flushed) return;
+    g_expert_stash_flushed = 1;
+    if (!g_expert_pool.valid || ds4_gpu_set_current_device(0) != 0) return;
+    uint32_t loaded = 0;
+    for (uint32_t L = 0; L < DS4_CUDA_EXPERT_POOL_MAX_LAYERS; L++) {
+        cuda_expert_stash *st = &g_expert_stash[L];
+        if (!st->valid) continue;
+        for (uint32_t i = 0; i < st->n; i++) {
+            const int32_t e = st->ids[i];
+            if (e < 0 || (uint32_t)e >= st->table.n_total_expert) continue;
+            const int32_t slot =
+                cuda_expert_pool_admit(L, (uint32_t)e, L, 1);
+            if (slot < 0) break;
+            if (!cuda_expert_pool_seed_one(&st->table, (uint32_t)e, slot)) {
+                cuda_expert_pool_forget(L, (uint32_t)e, slot);
+                break;
+            }
+            loaded++;
+        }
+    }
+    if (loaded != 0) {
+        fprintf(stderr, "ds4: CUDA expert pool hot-seeded %u experts at first decode\n",
+                loaded);
+    }
+}
+
+static int cuda_expert_pool_seed_ids(const ds4_gpu_stream_expert_table *table,
+                                     const int32_t *ids, uint32_t n) {
+    if (!table || !ids || n == 0 || !g_ssd_streaming_mode) return 1;
+    cuda_expert_pool_env_read_once();
+    /* Auto sizing cannot allocate before the arena settles; stash the hotlist
+     * and load it when the pool appears. */
+    if (g_expert_pool_bytes == 0 && g_expert_pool_cap < 0 &&
+        !g_expert_pool.valid) {
+        if (table->layer < DS4_CUDA_EXPERT_POOL_MAX_LAYERS) {
+            cuda_expert_stash *st = &g_expert_stash[table->layer];
+            st->valid = 1;
+            st->table = *table;
+            st->n = n > 256u ? 256u : n;
+            for (uint32_t i = 0; i < st->n; i++) st->ids[i] = ids[i];
+        }
+        return 1;
+    }
+    if (!cuda_expert_pool_ensure(table->n_total_expert,
+                                 table->gate_expert_bytes,
+                                 table->down_expert_bytes, 1)) {
+        return 1;
+    }
+    if (ds4_gpu_set_current_device(0) != 0) return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t expert = ids[i];
+        if (expert < 0 || (uint32_t)expert >= table->n_total_expert) continue;
+        const int32_t slot =
+            cuda_expert_pool_admit(table->layer, (uint32_t)expert,
+                                   table->layer, 1);
+        if (slot < 0) break;   /* pool full: the remaining seeds are colder */
+        if (!cuda_expert_pool_seed_one(table, (uint32_t)expert, slot)) {
+            cuda_expert_pool_forget(table->layer, (uint32_t)expert, slot);
+            break;
+        }
+    }
+    return 1;
+}
+
+__global__ static void cpu_expert_add_kernel(float *dst, const float *src,
+                                             uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+static void    *g_cpu_add_stage;
+static uint64_t g_cpu_add_stage_bytes;
+
+/* Add a host-computed expert contribution to a device tensor. Used by the
+ * CPU expert offload path, which maps those experts to the zero table slot on
+ * the GPU and supplies the real result here. */
+extern "C" int ds4_gpu_add_host_f32(ds4_gpu_tensor *dst, const float *host,
+                                    uint32_t n) {
+    if (!dst || !host || n == 0 ||
+        dst->bytes < (uint64_t)n * sizeof(float)) {
+        return 0;
+    }
+    const int tier = ds4_tensor_device_idx(dst);
+    if (ds4_gpu_set_current_device(tier) != 0) return 0;
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    if (g_cpu_add_stage_bytes < bytes) {
+        if (g_cpu_add_stage) (void)cudaFree(g_cpu_add_stage);
+        g_cpu_add_stage = NULL;
+        g_cpu_add_stage_bytes = 0;
+        if (cudaMalloc(&g_cpu_add_stage, (size_t)bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_cpu_add_stage_bytes = bytes;
+    }
+    const cudaStream_t st = cuda_decode_stream();
+    /* Synchronous by design: `host` is a caller buffer (the offload fold reuses
+     * one per layer), and an async H2D would let the next layer overwrite it
+     * while this copy is still reading. The payload is a single activation
+     * vector, so the copy is trivial next to the kernel it feeds. */
+    if (cudaMemcpy(g_cpu_add_stage, host, (size_t)bytes,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cpu_expert_add_kernel<<<(n + 255u) / 256u, 256, 0, st>>>(
+            (float *)dst->ptr, (const float *)g_cpu_add_stage, n);
+    return cuda_ok(cudaGetLastError(), "cpu expert add");
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
+    return g_expert_pool.valid ? g_expert_pool.slots_cap : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
+    return g_expert_pool.valid ? g_expert_pool.slots_used : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -33590,15 +36229,14 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
-    cuda_layer_resident_release_all();
+    cuda_expert_pool_release();
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t n_selected) {
-    (void)table; (void)selected_ids; (void)n_selected;
-    return 1;
+    return cuda_expert_pool_seed_ids(table, selected_ids, n_selected);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -33610,8 +36248,9 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         (uint64_t)n_tokens * n_selected > UINT32_MAX) {
         return 0;
     }
+    cuda_stream_phase_enter(1);   /* batched prefill: free the decode pool */
     return cuda_stream_selected_cache_begin_load(
-            table, selected_ids, n_tokens * n_selected);
+            table, selected_ids, n_tokens * n_selected, 0);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
@@ -33619,8 +36258,8 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t *expert_ids,
         const uint32_t *expert_priorities,
         uint32_t n_experts) {
-    (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
-    return 1;
+    (void)expert_priorities;   /* ids are already priority-ordered */
+    return cuda_expert_pool_seed_ids(table, expert_ids, n_experts);
 }
 
 extern "C" int ds4_gpu_argmax_tensor(
@@ -33864,3 +36503,187 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 /* DeepSeek V4.1 primitives. Kept in a separate include so the rest of the
  * CUDA backend (and the discrete-GPU streaming tuning) stays untouched. */
 #include "ds4_cuda_dsv41.inc"
+
+/* =========================================================================
+ * Terminal profiler backend (see ds4_profiler.c).
+ * ========================================================================= */
+
+/* Free VRAM for the engine's prefill-chunk sizing. Logical ids follow the
+ * backend's order, which is what --gpu-devices and the role plan use. */
+extern "C" uint64_t ds4_gpu_free_bytes(int device_id) {
+    if (device_id < 0 || device_id >= g_n_gpus) return 0;
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (cudaSetDevice(g_gpu[device_id].device_id) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    size_t free_b = 0, total_b = 0;
+    const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    (void)cudaSetDevice(prev);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return (uint64_t)free_b;
+}
+
+/* Benchmark each tier's host<->device path once. The profiler bar is drawn
+ * against this measured peak, which needs no PCIe generation/width attribute
+ * (CUDA does not expose them). */
+extern "C" void ds4_gpu_profiler_init(void) {
+    /* The probe sets the current device on the calling thread. Restore it, or
+     * the next graph operation could run on the wrong device. */
+    int prev = 0;
+    (void)cudaGetDevice(&prev);
+    for (int t = 0; t < g_n_gpus && t < DS4_MAX_GPUS; t++) {
+        if (g_prof_pcie_max_bps[t] != 0) continue;
+        const double gbps = cuda_probe_pcie_bw_gbps(
+                g_gpu[t].device_id, 32ull * 1024ull * 1024ull);
+        g_prof_pcie_max_bps[t] = (uint64_t)(gbps * 1e9);
+    }
+    (void)cudaSetDevice(prev);
+}
+
+extern "C" void ds4_gpu_profiler_stats(ds4_profiler_stats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->ssd_read_bytes = g_prof_ssd_read_bytes;
+    uint64_t resident = g_host_experts_resident;
+    if (g_stream_keep_expert_cache && resident > g_stream_keep_expert_cache) {
+        /* The page cache cannot hold more than the configured budget. */
+        resident = g_stream_keep_expert_cache;
+    }
+    uint64_t arena_cap = 0, arena_used = 0, arena_hits = 0, arena_misses = 0;
+    uint32_t arena_experts = 0;
+    ds4_gpu_host_arena_stats_t arena_stats;
+    ds4_gpu_host_arena_stats(&arena_stats);
+    arena_cap = arena_stats.capacity_bytes;
+    arena_used = arena_stats.used_bytes;
+    arena_experts = arena_stats.experts;
+    arena_hits = arena_stats.hits;
+    arena_misses = arena_stats.misses;
+    if (arena_cap != 0) {
+        /* The pinning is real, so the arena is the authority: an expert is in
+         * host RAM only if the arena holds it. */
+        resident = arena_experts;
+    }
+    out->host_experts_resident = resident;
+    out->host_expert_bytes = g_stream_expert_bytes;
+    out->host_arena_capacity_bytes = arena_cap;
+    out->host_arena_used_bytes = arena_used;
+    out->host_arena_experts = arena_experts;
+    out->host_arena_hits = arena_hits;
+    out->host_arena_misses = arena_misses;
+    out->host_arena_admissions = arena_stats.admissions;
+    out->host_arena_evictions = arena_stats.evictions;
+    out->host_arena_evicted_fetches = arena_stats.evicted_fetches;
+    /* Process-wide consumers that live on tier 0, measured once per sample. */
+    uint64_t arena_bytes = 0;
+    for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
+    uint64_t pool_reserved = 0;
+    {
+        cudaMemPool_t defpool = NULL;
+        int dev0 = 0;
+        (void)cudaGetDevice(&dev0);
+        if (cudaDeviceGetDefaultMemPool(&defpool, dev0) == cudaSuccess &&
+            defpool != NULL) {
+            (void)cudaMemPoolGetAttribute(defpool,
+                                          cudaMemPoolAttrReservedMemCurrent,
+                                          &pool_reserved);
+        }
+        (void)cudaGetLastError();
+    }
+    const int n = g_n_gpus > 0 ? g_n_gpus : 1;
+    out->n_devices = n < DS4_PROFILER_MAX_DEV ? n : DS4_PROFILER_MAX_DEV;
+    for (int t = 0; t < out->n_devices; t++) {
+        ds4_profiler_device *d = &out->dev[t];
+        d->device_id = g_gpu[t].device_id;
+        size_t free_b = 0, total_b = 0;
+        int dev_ok = 1;
+        if (cudaSetDevice(d->device_id) != cudaSuccess ||
+            cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            (void)cudaGetLastError();
+            dev_ok = 0;
+        }
+        if (dev_ok) {
+            d->vram_total_bytes = total_b;
+            d->vram_used_bytes = total_b >= free_b ? total_b - free_b : 0;
+        }
+        d->pcie_tx_bytes = g_prof_tx[t];
+        d->pcie_rx_bytes = g_prof_rx[t];
+        d->pcie_max_bytes_per_s = g_prof_pcie_max_bps[t];
+        /* Static specs from the startup probe, matched by device id. */
+        {
+            ds4_gpu_device_probe pr[DS4_MAX_GPUS];
+            const int np = ds4_gpu_role_probe_snapshot(pr, DS4_MAX_GPUS);
+            for (int k = 0; k < np; k++) {
+                if (pr[k].device_id != d->device_id) continue;
+                snprintf(d->name, sizeof(d->name), "%s", pr[k].name);
+                d->mem_bw_bytes_per_s = (uint64_t)(pr[k].vram_bw_gbps * 1e9);
+                d->compute_flops_fp16 = (uint64_t)(pr[k].fp16_tflops * 1e12);
+                d->sm_count = (uint32_t)pr[k].sm_count;
+                d->pcie_gen = pr[k].pcie_gen;
+                d->pcie_width = pr[k].pcie_width;
+                d->tensor_gen = pr[k].tensor_gen;
+                d->p2p = pr[k].p2p_capable;
+                d->nvlink = pr[k].nvlink;
+                break;
+            }
+        }
+        d->weight_bytes = g_prof_weight_bytes[t];
+        d->activation_bytes = g_prof_activation_bytes[t];
+        d->scratch_bytes = g_gpu[t].scratch_bytes;
+        d->tensor_bytes = g_gpu[t].used_bytes;
+        if (t == 0) {
+            /* Dense (non-routed) residency lives on the compute tier. */
+            d->dense_bytes = g_model_range_bytes + g_q8_f16_bytes + g_q8_f32_bytes;
+            d->arena_bytes = arena_bytes;
+            d->derived_bytes = g_derived_artifact_bytes;
+            d->temp_bytes = g_cuda_tmp_bytes + g_tt_scratch_bytes;
+            d->mempool_bytes = pool_reserved;
+            snprintf(d->type, sizeof(d->type), "dense");
+        }
+        if (g_expert_pool.valid && t < g_expert_pool.n_tiers &&
+            g_expert_pool.slot_cap[t] != 0) {
+            /* Report residency, not ceiling: the expert-distribution header
+             * derives the cold/SSD count from what is actually resident, so
+             * an unfilled pool must not overstate GPU-resident experts. */
+            uint32_t resident = 0;
+            for (uint32_t s = g_expert_pool.slot_base[t];
+                 s < g_expert_pool.slot_base[t] + g_expert_pool.slot_cap[t]; s++) {
+                if (g_expert_pool.slot_layer[s] >= 0) resident++;
+            }
+            d->expert_count = resident;
+            d->expert_bytes = g_expert_pool.gate_capacity[t] +
+                              g_expert_pool.up_capacity[t] +
+                              g_expert_pool.down_capacity[t];
+            d->expert_size_bytes =
+                g_expert_pool.gate_expert_bytes * 2u +
+                g_expert_pool.down_expert_bytes;
+            snprintf(d->expert_type, sizeof(d->expert_type), "%s",
+                     g_prof_expert_type[0] ? g_prof_expert_type : "routed");
+        }
+        {
+            const cuda_prof_resident &r = g_prof_resident[d->device_id];
+            d->dense_bytes += r.dense;
+            if (r.entries != 0) {
+                /* Startup hot bank: installed once, computed in place, never
+                 * transferred, so every entry is resident on this tier. */
+                d->expert_count += r.entries;
+                d->expert_bytes += r.expert;
+                if (d->expert_size_bytes == 0) {
+                    d->expert_size_bytes = r.expert / r.entries;
+                }
+                if (d->expert_type[0] == 0) {
+                    snprintf(d->expert_type, sizeof(d->expert_type), "%s",
+                             g_prof_expert_type[0] ? g_prof_expert_type : "routed");
+                }
+            }
+        }
+    }
+    (void)cudaSetDevice(0);
+}

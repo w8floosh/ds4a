@@ -36,6 +36,118 @@ This is also the multi-GPU placement mode for GLM. Startup refuses a layout
 that would require unsupported CPU execution; reduce context or choose a
 smaller model if necessary.
 
+## Device scoring and role assignment
+
+When several devices are configured, startup probes each one (PCIe link
+generation/width, measured pinned host-to-device bandwidth, free/total VRAM,
+memory bandwidth, FP16 throughput, SM count, tensor generation, peer access)
+and normalizes those metrics across the set. Each device is scored for
+prefill, decode, and capacity:
+
+```text
+S_prefill  = 0.5*norm(pcie_bw) + 0.3*norm(fp16) + 0.2*norm(vram_bw)
+S_decode   = 0.4*norm(vram_bw) + 0.3*norm(fp16) + 0.2*norm(vram_free) + 0.1*norm(sm)
+S_capacity = 0.8*norm(vram_free) + 0.1*norm(vram_bw) + 0.1*norm(pcie_bw)
+```
+
+The decode winner becomes the primary device, the capacity winner the expert
+cache, and the prefill winner the secondary. `--gpu-devices` is reordered so
+the layer packer fills primary, then cache, then secondary. Device 0 is the
+one the engine treats as the dense-weight home, so the ordering is what makes
+the roles take effect without a second placement path. With one device (or
+`--disable-multi-gpu`) the plan degrades to single-GPU mode and the caller's
+device order is left untouched, so nothing changes for existing setups.
+
+The plan is emitted as TSON on stderr so it can be logged or diffed:
+
+```text
+ds4.roles.n_gpus = 2
+ds4.roles.primary = 0
+ds4.roles.cache = 1
+ds4.roles.dev[0] = {id:0 name:... role:primary s_prefill:... s_decode:... ...}
+```
+
+Overrides:
+
+```sh
+./ds4 --cuda --gpu-devices 0,1 --gpu-vram auto \
+  --force-primary-gpu 0 --force-cache-gpu 1 \
+  --kv-cache-location vram --chunk-size 4096
+```
+
+* `--force-primary-gpu N` / `--force-cache-gpu N` pin a role by physical id.
+* `--disable-multi-gpu` forces single-GPU mode.
+* `--kv-cache-location vram|ram|gpu:N` records the requested KV home. Host
+  (`ram`) residency is not implemented yet; the engine warns and keeps the KV
+  cache in device VRAM.
+* `--chunk-size N` sets the prefill chunk target (alias for
+  `--prefill-chunk`); when unset the plan reports a recommendation from the
+  primary device's free VRAM (512/2048/4096/8192).
+
+`--cuda-tensor-parallel` fixes its own device order (homes first, then
+partners), so scoring is skipped there.
+
+## SSD streaming with multiple GPUs
+
+`--ssd-streaming` can be combined with `--gpu-devices`/`--gpu-vram`. In that
+mode one device (tier 0) computes, and every other configured device is used
+as a pinned expert-cache tier, so a run draws on **SSD** (cold experts), **host
+RAM** (the `--ssd-streaming-cache-experts` page cache), and **every GPU's
+VRAM** (the Least-Stale resident pool) at once:
+
+```sh
+./ds4 --cuda --ssd-streaming --gpu-devices 0,1 --gpu-vram auto \
+  --ssd-streaming-cache-experts 50GB --ctx 32768
+```
+
+The pool partitions one global slot namespace by tier (`slot_base`/`slot_cap`)
+and records each slot's owning tier. On decode a hit on a secondary tier is
+served with a peer copy of that expert's gate/up/down into the tier-0 per-call
+table; a miss is uploaded into the table and promoted into a slot on whichever
+tier has room. Compute stays on tier 0, so the proven single-device streaming
+kernels are unchanged. Secondary tiers are only admitted when the peer path to
+tier 0 was validated at startup; if peer access is unavailable the pool simply
+stays on tier 0 and behavior is exactly the single-GPU streaming path. Startup
+logs the split, e.g. `expert pool: N slots across 2 GPUs (tiers 0:153 1:846)`.
+
+Role scoring still runs first when `--gpu-devices` is given, so the primary
+device is the decode winner and the cache device is the capacity winner; the
+pool fills the primary tier before the cache tier.
+
+### Pinned host expert arena
+
+The page cache is only a hint: the kernel may evict any page without telling the
+process, and a long prefill sweep is exactly the kind of read that evicts a hot
+decode set. `--expert-arena` replaces that hint with a guarantee — the hottest
+routed experts are held in **non-pageable** host memory, so a resident expert is
+uploaded with a single DMA and no file read, and the kernel cannot take it back.
+
+```sh
+./ds4 --cuda --ssd-streaming --gpu-devices 0,1 \
+  --expert-arena 40GB --ctx 32768
+```
+
+Omitted, the arena defaults to 7/8 of the host RAM left after reserving a kernel/process headroom of a
+few GB (1/16 of physical memory, floored at 2 GB, capped at 8 GB) and subtracting the graph/KV estimate.
+Pinned pages are not reclaimable, so that headroom is a requirement, not a preference: the engine must
+never take the RAM the kernel needs. `--expert-arena 0` disables it. When the arena is active the
+streaming read path drops to O_DIRECT automatically, because a page cache beside a pin would compete for
+the same RAM and hand back the prefill pollution the arena exists to remove.
+
+Start-up fills only a bounded seed (`--expert-arena-preload`, default the
+smaller of 8 GB and the arena) and the rest fills from live reads as the session
+runs. That is deliberately how the arena is meant to populate: filling from the
+session's own routing beats an offline hotlist, and while slots are still free
+every admission is additive with no eviction. On a 306-token session this reached
+11.2 tokens/s with a 6.5 ms host read, against 8.6 tokens/s and 52 ms for a full
+40 GB preload — and a 4.7 s start instead of 24 s. `--expert-arena-preload NGB`
+forces an eager fill when that is what you want.
+
+The dashboard's storage panel reports the arena's residency and split fetches
+(`arena_hits` / `arena_misses`), and, when runtime admission is on,
+`arena_admissions`, `arena_evictions` and `arena_evicted_fetches` — so eviction
+is something you can watch happen rather than assume.
+
 ## Flash tensor parallelism
 
 `--cuda-tensor-parallel` pairs GPUs and divides routed-expert work inside

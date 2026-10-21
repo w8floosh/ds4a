@@ -222,6 +222,33 @@ This is a weight-energy heuristic.  It is not as good as measuring real DS4
 activations, but it gives the quantizer a stable column weighting and was good
 enough for the first working 2-bit GGUFs.
 
+## Low-Rank (SVD) Analysis Of Routed Experts
+
+`expert_svd_analysis.py` estimates how far the routed-expert matrices can be
+compressed with a rank-k SVD. It dequantizes each sampled expert, computes the
+exact singular spectrum from the smaller Gram matrix, and reports per layer and
+per projection:
+
+- rank definitions (effective rank at 99%/99.9% energy, numerical rank),
+- memory saved for a rank-k base stored in `f16`/`bf16`/`f32`,
+- decode speedup (bandwidth bound) and prefill speedup (compute bound),
+- truncation error relative to the dequantized weights,
+- the `k*min(m,n)` and `k*(m+n)` parameter ratios versus `m*n`.
+
+```sh
+# quick sample: 4 experts per projection in every layer
+python3 gguf-tools/expert_svd_analysis.py --experts 4 --workers 8
+
+# exact full pass (slow: ~33k expert matrices) and JSON output
+python3 gguf-tools/expert_svd_analysis.py --experts 0 --json /tmp/expert_svd.json
+
+# keep a hypothetical residual at 2 bpw instead of dropping it
+python3 gguf-tools/expert_svd_analysis.py --residual-bpw 2
+```
+
+The script needs `numpy` and the `gguf` Python package; everything else is
+standard library. The full pass is CPU bound and parallelises over experts.
+
 ## Quality Testing
 
 See `quality-testing/README.md`.  The short version is:

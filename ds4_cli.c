@@ -1,6 +1,10 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_gpu_roles.h"
+#include "ds4_profiler.h"
+#include "ds4_dashboard.h"
+#include "ds4_tui.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
@@ -102,11 +106,52 @@ typedef struct {
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    /* optimizations.md §11.3 role/placement overrides. */
+    ds4_gpu_roles_config roles;
+    /* Interactive terminal UI. Auto-on when both ends are terminals. */
+    bool tui;
+    bool tui_explicit;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
 static volatile sig_atomic_t cli_dist_busy;
 static volatile sig_atomic_t cli_dist_notice_printed;
+
+/* --dashboard-bind / --dashboard-lan: where the telemetry dashboard listens.
+ * NULL keeps the loopback default. See ds4_dashboard.h for the warning. */
+static const char *cli_dashboard_bind;
+/* Headless profiler output: a report written when the run ends, with the
+ * newest records in full detail. `--profile-dump -` writes to stdout. */
+static const char *cli_profile_dump_path;
+static int cli_profile_dump_kind = -1;     /* DS4_PREC_*, -1 = every kind */
+static int cli_profile_dump_records = 8;
+static ds4_tui *g_tui;
+
+static bool cli_interrupt_requested(void);
+static void cli_interrupt_clear(void);
+
+static void cli_tui_sink(void *ud, const char *text, size_t len, int think) {
+    (void)ud;
+    if (g_tui) ds4_tui_chat_append(g_tui, text, len, think);
+}
+
+static void cli_notice(const char *fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (g_tui) ds4_tui_log(g_tui, 0, "%s", buf);
+    else printf("%s", buf);
+}
+
+static int cli_tui_irq(void *ud) { (void)ud; return cli_interrupt_requested(); }
+static void cli_tui_irq_clear(void *ud) { (void)ud; cli_interrupt_clear(); }
+static bool cli_session_cancel(void *ud) { (void)ud; return cli_interrupt_requested(); }
+static void cli_line_free(char *line) {
+    if (!line) return;
+    if (g_tui) free(line); else linenoiseFree(line);
+}
 
 static const char cli_dist_drain_msg[] =
     "\nds4: stopping after the distributed cluster finishes the current token/chunk...\n";
@@ -323,9 +368,20 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     const bool is_display =
         strcmp(event, "prefill_display") == 0;
     if (strcmp(event, "prefill_chunk") && !is_display) return;
-    if (is_display && !p->use_color) return;
+    if (!g_tui && is_display && !p->use_color) return;
 
     int processed = current - p->base_tokens;
+    if (g_tui) {
+        if (processed < 0) processed = 0;
+        if (processed > p->input_tokens) processed = p->input_tokens;
+        ds4_tui_status(g_tui, "prefill %d/%d (%.1f%%)",
+                       processed, p->input_tokens,
+                       100.0 * processed / (double)p->input_tokens);
+        ds4_tui_pump(g_tui);
+        if (!strcmp(event, "prefill_chunk"))
+            ds4_tui_breakpoint(g_tui, "prefill chunk");
+        return;
+    }
     if (processed < 0) processed = 0;
     if (processed > p->input_tokens) processed = p->input_tokens;
     double pct = 100.0 * (double)processed / (double)p->input_tokens;
@@ -386,7 +442,17 @@ typedef struct {
     bool last_output_newline;
     char pending[16];
     size_t pending_len;
+    /* When set, output goes here instead of stdio (the terminal UI). */
+    void (*sink)(void *ud, const char *text, size_t len, int think);
+    void *sink_ud;
 } token_printer;
+
+static void token_printer_emit(token_printer *p, const char *text, size_t len) {
+    if (len == 0) return;
+    if (p->sink) p->sink(p->sink_ud, text, len, p->in_think ? 1 : 0);
+    else fwrite(text, 1, len, p->fp);
+    p->last_output_newline = text[len - 1] == '\n';
+}
 
 static bool bytes_has_prefix(const char *p, size_t n, const char *prefix) {
     size_t plen = strlen(prefix);
@@ -413,9 +479,8 @@ static void token_printer_reset_color(token_printer *p) {
 }
 
 static void token_printer_write_char(token_printer *p, char c) {
-    if (p->in_think) token_printer_set_grey(p);
-    fputc((unsigned char)c, p->fp);
-    p->last_output_newline = c == '\n';
+    if (p->in_think && !p->sink) token_printer_set_grey(p);
+    token_printer_emit(p, &c, 1);
 }
 
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
@@ -439,9 +504,9 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
         }
         if (bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
-            token_printer_reset_color(p);
+            if (!p->sink) token_printer_reset_color(p);
             if (!p->last_output_newline) {
-                fputc('\n', p->fp);
+                token_printer_emit(p, "\n", 1);
                 p->last_output_newline = true;
             }
             i += strlen(think_close);
@@ -467,7 +532,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
 static void token_printer_finish(token_printer *p) {
     if (p->format_thinking) {
         token_printer_process(p, NULL, 0, true);
-        token_printer_reset_color(p);
+        if (!p->sink) token_printer_reset_color(p);
     }
     fflush(p->fp);
 }
@@ -476,18 +541,17 @@ static void generation_done(void *ud) {
     token_printer *p = ud;
     token_printer_finish(p);
     if (!p->last_output_newline) {
-        fputc('\n', p->fp);
+        token_printer_emit(p, "\n", 1);
         p->last_output_newline = true;
     }
-    fflush(p->fp);
+    if (!p->sink) fflush(p->fp);
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
     if (p->format_thinking) {
         token_printer_process(p, text, len, false);
     } else if (len) {
-        fwrite(text, 1, len, p->fp);
-        p->last_output_newline = text[len - 1] == '\n';
+        token_printer_emit(p, text, len);
     }
 }
 
@@ -496,7 +560,34 @@ static void print_generated_token(void *ud, int token) {
     size_t len = 0;
     char *text = ds4_token_text(p->engine, token, &len);
     token_printer_write_text(p, text, len);
-    fflush(p->fp);
+    if (!p->sink) fflush(p->fp);
+    free(text);
+}
+
+
+/* Detokenize, hand the text to the sink, and charge the time to the token
+ * record. This is part of what the user waits for, but it is not model
+ * compute, so it gets its own row. */
+static void cli_stream_token(ds4_engine *engine, token_printer *printer, int token) {
+    const double t0 = cli_now_sec();
+    size_t piece_len = 0;
+    char *piece = ds4_token_text(engine, token, &piece_len);
+    token_printer_write_text(printer, piece, piece_len);
+    if (!printer->sink) fflush(stdout);
+    free(piece);
+    ds4_profiler_note_step(DS4_PSTEP_HOST_DETOK,
+                           (uint64_t)((cli_now_sec() - t0) * 1e9), 1, 0);
+    if (g_tui) ds4_tui_pump(g_tui);
+}
+
+
+static void cli_token_begin(ds4_engine *engine, ds4_session *session, int token) {
+    if (!ds4_profiler_token_begin_ex(DS4_PREC_DECODE_TOKEN, token,
+                                     ds4_session_pos(session), 1))
+        return;
+    size_t len = 0;
+    char *text = ds4_token_text(engine, token, &len);
+    if (text) ds4_profiler_record_text(text, len);
     free(text);
 }
 
@@ -584,6 +675,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
+    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, prompt->len);
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
@@ -618,12 +710,14 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
+            cli_token_begin(engine, session, token);
             ntok = ds4_session_eval_speculative(
                 session, token, max_tokens - generated,
                 ds4_token_eos(engine), cfg->gen.temperature, 0,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
+            ds4_profiler_token_end(ntok > 0 ? (uint64_t)ntok : 1);
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -631,18 +725,16 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, token, &piece_len);
-            token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
-            free(piece);
+            cli_stream_token(engine, &printer, token);
             generated++;
             if (generated >= max_tokens || cli_interrupt_requested()) {
                 continue;
             }
 
             cli_dist_busy_set(cfg, true);
+            cli_token_begin(engine, session, token);
             int eval_rc = ds4_session_eval(session, token, err, sizeof(err));
+            ds4_profiler_token_end(1);
             cli_dist_busy_set(cfg, false);
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -658,11 +750,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 stop = true;
                 break;
             }
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, toks[j], &piece_len);
-            token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
-            free(piece);
+            cli_stream_token(engine, &printer, toks[j]);
             generated++;
             if (generated >= max_tokens) break;
         }
@@ -1237,6 +1325,9 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                     ds4_backend_name(cfg->engine.backend));
         }
     } else {
+        /* Single-shot generation exposes the dashboard too, so a scripted run
+         * is observable without the interactive REPL. */
+        ds4_dashboard_start(cli_dashboard_bind, 0, 1);
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
@@ -1284,6 +1375,21 @@ static char *trim_inplace(char *s) {
 }
 
 static void print_repl_help(void) {
+    if (g_tui) {
+        ds4_tui_log(g_tui, 0,
+            "commands:\n"
+            "  /help          show this help\n"
+            "  /think [N]     normal thinking, or V4.1 effort 0..100\n"
+            "  /think-max     maximum thinking\n"
+            "  /nothink       disable thinking\n"
+            "  /ctx N         set context size\n"
+            "  /power N       GPU duty cycle 1..100\n"
+            "  /steer F       FFN steering -100..100\n"
+            "  /read FILE     submit text, PNG or JPEG\n"
+            "  /quit, /exit   leave the prompt\n"
+            "  Ctrl+C         stop generation");
+        return;
+    }
     puts("Commands:");
     puts("  /help          Show this help.");
     puts("  /think [N]     Use normal thinking, or V4.1 effort 0..100 (0 disables thinking).");
@@ -1436,6 +1542,7 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
         fprintf(stderr, "ds4: interactive chat KV cache requires a session backend\n");
         return 1;
     }
+    ds4_session_set_cancel(session, cli_session_cancel, NULL);
     if (chat->session) ds4_session_free(chat->session);
     chat->session = session;
     chat->ctx_size = ctx_size;
@@ -1518,6 +1625,14 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         fprintf(stderr, "ds4: no active interactive KV cache\n");
         return 1;
     }
+    if (g_tui) {
+        ds4_tui_chat_role(g_tui, 0, "you");
+        if (user_text && user_text[0])
+            ds4_tui_chat_append(g_tui, user_text, strlen(user_text), 0);
+        else
+            ds4_tui_chat_append(g_tui, "[image]", 7, 0);
+        ds4_tui_chat_newline(g_tui);
+    }
 
     ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
@@ -1559,6 +1674,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         .use_color = ds4_log_is_tty(stderr),
     };
     const double t_prefill0 = cli_now_sec();
+    if (g_tui) ds4_tui_set_busy(g_tui, 1, "prompt processing");
     ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
     ds4_session_set_display_progress(chat->session,
                                      progress.use_color ? cli_prefill_progress_cb : NULL,
@@ -1576,21 +1692,29 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         ds4_session_set_display_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
         repl_chat_trim_images(chat, rollback_images);
+        if (g_tui) ds4_tui_set_busy(g_tui, 0, NULL);
         fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
         return 1;
     }
     ds4_session_set_progress(chat->session, NULL, NULL);
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
+    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, (uint64_t)suffix);
 
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
         .in_think = ds4_think_mode_enabled(think_mode),
-        .use_color = isatty(fileno(stdout)) != 0,
+        .use_color = isatty(fileno(stdout)) != 0 && !g_tui,
         .last_output_newline = true,
     };
+    if (g_tui) {
+        printer.sink = cli_tui_sink;
+        printer.sink_ud = g_tui;
+        ds4_tui_chat_role(g_tui, 1, "assistant");
+        ds4_tui_set_busy(g_tui, 1, "decoding");
+    }
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(chat->session) - ds4_session_pos(chat->session);
@@ -1629,29 +1753,31 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             cli_dist_busy_set(cfg, true);
+            cli_token_begin(engine, chat->session, token);
             ntok = ds4_session_eval_speculative(
                 chat->session, token, max_tokens - generated,
                 ds4_token_eos(engine), cfg->gen.temperature, 0,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
+            ds4_profiler_token_end(ntok > 0 ? (uint64_t)ntok : 1);
             cli_dist_busy_set(cfg, false);
+            if (g_tui) ds4_tui_breakpoint(g_tui, "decode token");
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
         } else {
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, token, &piece_len);
             ds4_tokens_push(&chat->transcript, token);
-            token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
-            free(piece);
+            cli_stream_token(engine, &printer, token);
             generated++;
 
             cli_dist_busy_set(cfg, true);
+            cli_token_begin(engine, chat->session, token);
             int eval_rc = ds4_session_eval(chat->session, token, err, sizeof(err));
+            ds4_profiler_token_end(1);
             cli_dist_busy_set(cfg, false);
+            if (g_tui) ds4_tui_breakpoint(g_tui, "decode token");
             if (eval_rc != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_invalidate(chat->session);
@@ -1667,12 +1793,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
                 stop = true;
                 break;
             }
-            size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, toks[j], &piece_len);
             ds4_tokens_push(&chat->transcript, toks[j]);
-            token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
-            free(piece);
+            cli_stream_token(engine, &printer, toks[j]);
             generated++;
             if (generated >= max_tokens) break;
         }
@@ -1682,6 +1804,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     generation_done(&printer);
 
     const bool interrupted = cli_interrupt_requested();
+    if (g_tui) {
+        ds4_tui_chat_newline(g_tui);
+        ds4_tui_set_busy(g_tui, 0, NULL);
+    }
     if (interrupted && generated == 0) {
         chat->transcript.len = rollback_len;
         repl_chat_trim_images(chat, rollback_images);
@@ -1712,8 +1838,15 @@ static bool cli_file_has_image_magic(const char *path) {
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
+    g_tui = cfg->tui ? ds4_tui_create() : NULL;
+    if (g_tui)
+        ds4_tui_set_interrupt(g_tui, cli_tui_irq, cli_tui_irq_clear, NULL);
+
     repl_chat chat;
-    if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
+    if (repl_chat_init(engine, &chat, cfg) != 0) {
+        if (g_tui) { ds4_tui_destroy(g_tui); g_tui = NULL; }
+        return 1;
+    }
 
     struct sigaction old_int;
     struct sigaction sa;
@@ -1725,16 +1858,28 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
 
     char hist[PATH_MAX];
     history_file_path(hist, sizeof(hist));
-    linenoiseSetMultiLine(1);
-    linenoiseHistorySetMaxLen(512);
-    linenoiseHistoryLoad(hist);
-    print_repl_help();
+    if (!g_tui) {
+        linenoiseSetMultiLine(1);
+        linenoiseHistorySetMaxLen(512);
+        linenoiseHistoryLoad(hist);
+    }
 
     int rc = 0;
+    /* Start the local dashboard only when there is no full-screen UI or the
+     * operator explicitly asked for a network bind. */
+    if (!g_tui || cli_dashboard_bind)
+        ds4_dashboard_start(cli_dashboard_bind, 0, !g_tui);
+    if (g_tui) {
+        ds4_tui_log(g_tui, 0,
+            "commands: /help /think [N] /think-max /nothink /ctx N /power N /steer F /read FILE /quit");
+    } else {
+        print_repl_help();
+    }
     for (;;) {
         errno = 0;
-        char *line = linenoise("ds4> ");
+        char *line = g_tui ? ds4_tui_readline(g_tui, "ds4> ") : linenoise("ds4> ");
         if (!line) {
+            if (g_tui && !cli_interrupt_requested()) break;
             if (errno == EAGAIN || cli_interrupt_requested()) {
                 cli_interrupt_clear();
                 continue;
@@ -1743,11 +1888,13 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         }
         char *cmd = trim_inplace(line);
         if (!cmd[0]) {
-            linenoiseFree(line);
+            cli_line_free(line);
             continue;
         }
-        linenoiseHistoryAdd(cmd);
-        linenoiseHistorySave(hist);
+        if (!g_tui) {
+            linenoiseHistoryAdd(cmd);
+            linenoiseHistorySave(hist);
+        }
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();
@@ -1760,7 +1907,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "ds4: /think N requires V4.1 and a level from 0 to 100\n");
             } else if (repl_chat_apply_think_prefix(engine, &chat, mode)) {
                 cfg->gen.think_mode = mode;
-                printf("Thinking mode: %s.\n", ds4_think_mode_name(mode));
+                cli_notice("Thinking mode: %s.\n", ds4_think_mode_name(mode));
             }
         } else if (!strcmp(cmd, "/think-max")) {
             bool active = ds4_think_mode_for_context(DS4_THINK_MAX,
@@ -1769,17 +1916,17 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                                               active ? DS4_THINK_MAX : DS4_THINK_HIGH)) {
                 cfg->gen.think_mode = DS4_THINK_MAX;
                 cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
-                printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
+                cli_notice("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
             }
         } else if (!strcmp(cmd, "/nothink")) {
             if (repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_NONE)) {
                 cfg->gen.think_mode = DS4_THINK_NONE;
-                puts("Thinking mode: none.");
+                cli_notice("Thinking mode: none.\n");
             }
         } else if (!strncmp(cmd, "/power", 6) && (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
-                printf("Power: %d%%.\n", ds4_session_power(chat.session));
+                cli_notice("Power: %d%%.\n", ds4_session_power(chat.session));
             } else {
                 int power = 0;
                 if (!parse_power_percent(arg, &power)) {
@@ -1788,14 +1935,14 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     fprintf(stderr, "ds4: failed to set /power\n");
                 } else {
                     cfg->engine.power_percent = power;
-                    printf("Power: %d%%.\n", power);
+                    cli_notice("Power: %d%%.\n", power);
                 }
             }
         } else if (!strncmp(cmd, "/steer", 6) &&
                    (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
             char *arg = trim_inplace(cmd + 6);
             if (!arg[0]) {
-                printf("Steering FFN: %g.\n",
+                cli_notice("Steering FFN: %g.\n",
                        (double)ds4_session_directional_steering_ffn(chat.session));
             } else {
                 float scale = 0.0f;
@@ -1804,7 +1951,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 } else if (ds4_session_set_directional_steering_ffn(
                                    chat.session, scale) == 0) {
                     cfg->engine.directional_steering_ffn = scale;
-                    printf("Steering FFN: %g.\n", (double)scale);
+                    cli_notice("Steering FFN: %g.\n", (double)scale);
                 }
             }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
@@ -1819,7 +1966,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                                    cfg->engine.ssd_streaming);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
-                    linenoiseFree(line);
+                    cli_line_free(line);
                     break;
                 }
                 ds4_think_mode effective = ds4_think_mode_for_context(cfg->gen.think_mode,
@@ -1828,7 +1975,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
-            linenoiseFree(line);
+            cli_line_free(line);
             break;
         } else if (!strncmp(cmd, "/read", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
             char *path = trim_inplace(cmd + 5);
@@ -1861,11 +2008,47 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else {
             rc = run_chat_turn(engine, cfg, &chat, cmd, NULL);
         }
-        linenoiseFree(line);
+        cli_line_free(line);
     }
+    ds4_dashboard_stop();
+    if (g_tui) { ds4_tui_destroy(g_tui); g_tui = NULL; }
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     repl_chat_free(&chat);
     return rc;
+}
+
+/* Write the profiler report when the run ends. Loading the whole report into
+ * one buffer keeps the file (or stdout) a single artifact and lets the caller
+ * bound its size; a report too big for the buffer is marked, not cut. */
+static void write_profile_dump(void) {
+    const size_t cap = 16u * DS4_PROF_DUMP_CAP;
+    char *buf = malloc(cap);
+    if (!buf) {
+        fprintf(stderr, "ds4: out of memory for the profiler dump\n");
+        return;
+    }
+    const size_t n = ds4_profiler_report(buf, cap, cli_profile_dump_kind,
+                                         cli_profile_dump_records);
+    if (!strcmp(cli_profile_dump_path, "-")) {
+        fflush(stdout);
+        fwrite(buf, 1, n, stdout);
+        fflush(stdout);
+    } else {
+        FILE *fp = fopen(cli_profile_dump_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "ds4: cannot write profiler dump to %s\n",
+                    cli_profile_dump_path);
+        } else {
+            const size_t w = fwrite(buf, 1, n, fp);
+            if (fclose(fp) != 0 || w != n) {
+                fprintf(stderr, "ds4: short write to %s\n", cli_profile_dump_path);
+            } else {
+                fprintf(stderr, "ds4: profiler report written to %s (%zu bytes)\n",
+                        cli_profile_dump_path, n);
+            }
+        }
+    }
+    free(buf);
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -1942,7 +2125,10 @@ static cli_config parse_options(int argc, char **argv) {
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
         },
+        .tui = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO),
     };
+
+    ds4_gpu_roles_config_default(&c.roles);
 
     c.dist = ds4_dist_options_create();
     if (!c.dist) {
@@ -2087,6 +2273,46 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--expert-arena")) {
+            /* Pinned host expert arena budget. Omitted = host-memory default;
+             * 0 disables it; NGB pins that much non-pageable host memory. */
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "0")) {
+                c.engine.ssd_streaming_arena_set = true;
+                c.engine.ssd_streaming_arena_bytes = 0;
+            } else if (!ds4_parse_gib_arg(v, &c.engine.ssd_streaming_arena_bytes)) {
+                fprintf(stderr,
+                        "ds4: --expert-arena must be a positive GiB value (e.g. 40GB) or 0\n");
+                exit(2);
+            } else {
+                c.engine.ssd_streaming_arena_set = true;
+            }
+        } else if (!strcmp(arg, "--expert-arena-preload")) {
+            /* Cap the synchronous start-up fill; the rest fills from live
+             * reads. 0 starts with an empty arena. */
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "0")) {
+                c.engine.ssd_streaming_arena_preload_set = true;
+                c.engine.ssd_streaming_arena_preload_bytes = 0;
+            } else if (!ds4_parse_gib_arg(v, &c.engine.ssd_streaming_arena_preload_bytes)) {
+                fprintf(stderr,
+                        "ds4: --expert-arena-preload must be a positive GiB value or 0\n");
+                exit(2);
+            } else {
+                c.engine.ssd_streaming_arena_preload_set = true;
+            }
+        } else if (!strcmp(arg, "--dashboard-bind")) {
+            /* Serve the telemetry dashboard on the network instead of
+             * loopback. No authentication: trusted LANs only. */
+            cli_dashboard_bind = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tui")) {
+            c.tui = true;
+            c.tui_explicit = true;
+        } else if (!strcmp(arg, "--no-tui")) {
+            c.tui = false;
+            c.tui_explicit = true;
+        } else if (!strcmp(arg, "--dashboard-lan")) {
+            cli_dashboard_bind = "0.0.0.0";
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {
@@ -2109,6 +2335,23 @@ static cli_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--profile-dump")) {
+            cli_profile_dump_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--profile-records")) {
+            cli_profile_dump_records = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (cli_profile_dump_records < 0) {
+                fprintf(stderr, "ds4: --profile-records must be zero or more\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--profile-kind")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "all")) cli_profile_dump_kind = -1;
+            else if (!strcmp(v, "decode")) cli_profile_dump_kind = DS4_PREC_DECODE_TOKEN;
+            else if (!strcmp(v, "prefill")) cli_profile_dump_kind = DS4_PREC_PREFILL_CHUNK;
+            else {
+                fprintf(stderr, "ds4: --profile-kind expects decode, prefill, or all\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--expert-profile")) {
             c.engine.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -2138,6 +2381,26 @@ static cli_config parse_options(int argc, char **argv) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
             c.engine.cuda_tensor_parallel = true;
+        } else if (!strcmp(arg, "--force-primary-gpu")) {
+            c.roles.force_primary_gpu =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--force-cache-gpu")) {
+            c.roles.force_cache_gpu =
+                parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--disable-multi-gpu")) {
+            c.roles.disable_multi_gpu = 1;
+        } else if (!strcmp(arg, "--kv-cache-location")) {
+            const char *kv = need_arg(&i, argc, argv, arg);
+            if (ds4_gpu_roles_parse_kv_location(kv, &c.roles.kv_cache_location)) {
+                fprintf(stderr,
+                        "ds4: --kv-cache-location expects vram, ram, auto, or gpu:N\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--chunk-size")) {
+            /* parse_int already rejects non-positive values. */
+            c.roles.chunk_size =
+                (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.prefill_chunk = c.roles.chunk_size;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
@@ -2297,6 +2560,13 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    /* Clean slate for an interactive session: clear once here, before the
+     * model-load summary and REPL help are printed, so those messages land in
+     * the live scroll region below the profiler and stay visible. */
+    if (isatty(STDOUT_FILENO) && !cfg.inspect) {
+        ssize_t w = write(STDOUT_FILENO, "\033[2J\033[H", 7);
+        (void)w;
+    }
     cfg.engine.inspect_only = cfg.inspect;
     cfg.engine.first_token_test = cfg.gen.first_token_test;
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
@@ -2326,6 +2596,25 @@ int main(int argc, char **argv) {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
                 (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            /* optimizations.md §1/§11.1: score devices and order them
+             * primary, cache, secondary before the layer packer runs. CUDA
+             * tensor parallelism fixes its own device order (homes then
+             * partners), so leave it alone there. Scoring failure is not
+             * fatal: the explicit config is used as given. */
+            if (!cfg.engine.cuda_tensor_parallel &&
+                !cfg.roles.disable_multi_gpu) {
+                char role_err[256];
+                if (ds4_gpu_roles_apply(&gpu_cfg, &cfg.roles,
+                                        role_err, sizeof(role_err)) != 0) {
+                    fprintf(stderr, "ds4: device scoring skipped: %s\n", role_err);
+                }
+            } else if (cfg.roles.disable_multi_gpu) {
+                fprintf(stderr, "ds4: multi-GPU disabled; using device 0\n");
+            }
+#else
+            (void)cfg.roles;
+#endif
             char layout[256];
             if (format_gpu_layout_line(&gpu_cfg, was_auto,
                                        layout, sizeof(layout)) > 0) {
@@ -2408,6 +2697,12 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    /* Per-token records are the only thing that keeps what happened inside a
+     * token, and they are off by default so the hot path stays cheap. A run
+     * that asked for a dump or a trace needs them, whether or not the TUI (the
+     * other place that turns them on) is what drives the engine. */
+    if (cli_profile_dump_path || getenv("DS4_PROFILE_TRACE"))
+        ds4_profiler_set_record_enabled(1);
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
@@ -2433,6 +2728,7 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
+    if (cli_profile_dump_path) write_profile_dump();
     if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
     ds4_tp_free(tp_leader);

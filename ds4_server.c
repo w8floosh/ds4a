@@ -2,6 +2,7 @@
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_gpu_roles.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_tp.h"
@@ -14498,6 +14499,8 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    /* optimizations.md §11.3 role/placement overrides. */
+    ds4_gpu_roles_config roles;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -14642,6 +14645,7 @@ static server_config parse_options(int argc, char **argv) {
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
+    ds4_gpu_roles_config_default(&c.roles);
 
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -14830,6 +14834,24 @@ static server_config parse_options(int argc, char **argv) {
             c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--cuda-tensor-parallel")) {
             c.engine.cuda_tensor_parallel = true;
+        } else if (!strcmp(arg, "--force-primary-gpu")) {
+            c.roles.force_primary_gpu =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--force-cache-gpu")) {
+            c.roles.force_cache_gpu =
+                parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--disable-multi-gpu")) {
+            c.roles.disable_multi_gpu = 1;
+        } else if (!strcmp(arg, "--kv-cache-location")) {
+            const char *kv = need_arg(&i, argc, argv, arg);
+            if (ds4_gpu_roles_parse_kv_location(kv, &c.roles.kv_cache_location)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-cache-location expects vram, ram, auto, or gpu:N");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--chunk-size")) {
+            c.roles.chunk_size = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.prefill_chunk = c.roles.chunk_size;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
@@ -14936,6 +14958,21 @@ int main(int argc, char **argv) {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
                 (!cfg.gpu_vram_arg && cfg.gpu_devices_arg);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            if (!cfg.engine.cuda_tensor_parallel &&
+                !cfg.roles.disable_multi_gpu) {
+                char role_err[256];
+                if (ds4_gpu_roles_apply(&gpu_cfg, &cfg.roles,
+                                        role_err, sizeof(role_err)) != 0) {
+                    fprintf(stderr, "ds4-server: device scoring skipped: %s\n",
+                            role_err);
+                }
+            } else if (cfg.roles.disable_multi_gpu) {
+                fprintf(stderr, "ds4-server: multi-GPU disabled; using device 0\n");
+            }
+#else
+            (void)cfg.roles;
+#endif
             char layout[256];
             if (format_gpu_layout_line(&gpu_cfg, was_auto,
                                        layout, sizeof(layout)) > 0) {

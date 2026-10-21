@@ -47,10 +47,13 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score quality-llama-score
 
-all: deepseek4-quantize $(QUANTS_SHARED)
+all: deepseek4-quantize ds4-requant $(QUANTS_SHARED)
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+
+ds4-requant: ds4-requant.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ ds4-requant.c quants.c -lm -pthread
 
 $(QUANTS_SHARED): quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread

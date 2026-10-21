@@ -280,6 +280,7 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);
+int ds4_gpu_range_selectively_cached(uint64_t offset, uint64_t bytes);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
@@ -311,6 +312,9 @@ typedef struct {
 int ds4_gpu_device_cache_tensors(int device_id,
                                  const ds4_tensor_range *ranges,
                                  int n_ranges);
+/* Override the slab-alloc safety margin (MiB) for a device; 0 restores the
+ * 2 GiB default. Intended for a non-primary expert-cache tier. */
+void ds4_gpu_device_cache_set_safety_mib(int device_id, int mib);
 int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
 int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int entry_device_id,
@@ -363,6 +367,16 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Free VRAM in bytes on a backend device; 0 when the device is absent or the
+ * backend cannot report it. */
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+static inline uint64_t ds4_gpu_free_bytes(int device_id) {
+    (void)device_id;
+    return 0;
+}
+#else
+uint64_t ds4_gpu_free_bytes(int device_id);
+#endif
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -423,6 +437,45 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+/* Host pinned expert arena. A byte-budgeted resident set of routed experts in
+ * non-pageable host memory: a resident expert is uploaded with a single DMA
+ * straight from the arena, with no file read and no staging copy, and it stays
+ * resident for the whole run. Preload-only and additive: anything not resident
+ * (or of a different size class) is fetched exactly as before, so a small or
+ * failed arena costs throughput, never correctness. */
+int ds4_gpu_host_arena_configure(uint64_t bytes,
+                                 uint64_t gate_expert_bytes,
+                                 uint64_t down_expert_bytes);
+int ds4_gpu_host_arena_seed(const ds4_gpu_stream_expert_table *table,
+                            const int32_t *expert_ids,
+                            uint32_t n_experts);
+/* Turn runtime admission on (N = the fetch at which an expert may claim a slot)
+ * or off (0). Used when the preload is capped below the arena budget, because
+ * then live reads are the only thing that can fill the remainder. The
+ * DS4_HOST_ARENA_ADMIT environment variable still overrides this for
+ * experiments. */
+void ds4_gpu_host_arena_set_admission(uint32_t threshold);
+/* Arena residency and the traffic that keeps it honest. `hits` are selections
+ * served from pinned memory with no read; `misses` needed storage. Once the
+ * arena is full, `admissions` equals `evictions`, and `evicted_fetches` counts
+ * the fetches that had to re-read an expert the arena had dropped — the number
+ * that shows whether eviction is working for or against the run. */
+typedef struct {
+    uint64_t capacity_bytes;
+    uint64_t used_bytes;
+    uint32_t experts;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;
+    uint64_t evictions;
+    uint64_t evicted_fetches;
+} ds4_gpu_host_arena_stats_t;
+void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out);
+/* CPU expert offload: mark the selected experts the engine computes on the
+ * CPU for the next streaming load, and add their host-computed result to the
+ * routed output. The marked experts map to a zero table slot on the GPU. */
+void ds4_gpu_stream_expert_cache_set_cpu_experts(const int32_t *ids, uint32_t n);
+int  ds4_gpu_add_host_f32(ds4_gpu_tensor *dst, const float *host, uint32_t n);
 #ifdef __APPLE__
 /* Seed from mapped weights with blits appended to the active command buffer. */
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
@@ -583,7 +636,8 @@ int ds4_gpu_embed_token_hc_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd,
-        uint32_t          n_hc);
+        uint32_t          n_hc,
+        uint32_t          weight_type);   /* 1 = F16, 8 = Q8_0 */
 
 int ds4_gpu_embed_tokens_hc_tensor(
         ds4_gpu_tensor       *out_hc,
@@ -594,7 +648,8 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc);
+        uint32_t                n_hc,
+        uint32_t                weight_type);   /* 1 = F16, 8 = Q8_0 */
 
 int ds4_gpu_embed_token_q8_0_tensor(
         ds4_gpu_tensor *out,
@@ -2770,7 +2825,16 @@ int ds4_gpu_routed_moe_one_owned_tensor(
         const ds4_gpu_tensor *x,
         ds4_gpu_tensor       *down_output,
         bool                  pack_fixed3,
-        ds4_gpu_tensor       *shared_prequant);
+        ds4_gpu_tensor       *shared_prequant,
+        /* Frequency-ranked residency: source offset of the FIRST resident
+         * expert for each tensor. When nonzero the bank base is resolved at
+         * that offset with one expert's bytes (the slab packs the installed
+         * per-expert ranges contiguously), and `selected` carries local bank
+         * indices in [0, resident_expert_count). 0 = legacy contiguous range
+         * beginning at resident_expert_base. */
+        uint64_t              gate_bank_offset,
+        uint64_t              up_bank_offset,
+        uint64_t              down_bank_offset);
 
 int ds4_gpu_routed_moe_batch_owned_tensor(
         ds4_gpu_tensor       *out,
@@ -2820,6 +2884,20 @@ int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
         uint32_t              out_dim,
         uint32_t              expert_split,
         uint32_t              rows);
+
+/* Sum the per-slot outputs of ds4_gpu_routed_moe_one_owned_tensor into one
+ * routed vector (single owned tier, no peer combine). Slots whose expert id
+ * falls outside [expert_base, expert_base+expert_count) are skipped: the owned
+ * down kernels leave non-owned slots untouched, so folding them would inject
+ * uninitialized memory. */
+int ds4_gpu_routed_moe_owned_sum_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *slots,
+        const ds4_gpu_tensor *selected,
+        uint32_t              out_dim,
+        uint32_t              n_slots,
+        uint32_t              expert_base,
+        uint32_t              expert_count);
 
 int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         ds4_gpu_tensor       *out,

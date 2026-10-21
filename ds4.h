@@ -144,6 +144,11 @@ typedef struct {
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    /* Pinned host expert arena. Explicit when --expert-arena is given;
+     * otherwise resolved from host memory at open time. `preload` caps the
+     * synchronous start-up fill, with runtime admission covering the rest. */
+    uint64_t ssd_streaming_arena_bytes;
+    uint64_t ssd_streaming_arena_preload_bytes;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
@@ -159,6 +164,10 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    /* --expert-arena was given: the value is authoritative, including 0 for
+     * "off", instead of the host-memory default. */
+    bool ssd_streaming_arena_set;
+    bool ssd_streaming_arena_preload_set;
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
@@ -497,6 +506,16 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* CPU quantized-dot kernels take opaque GGUF blocks.  The scalar reference
+ * stays available so a single binary can prove SIMD bit-exactness and
+ * measure the speedup. */
+void ds4_test_cpu_set_simd(int enabled);
+void ds4_test_vec_dot_iq2_xxs(int n, const void *x, const void *y, float *s);
+void ds4_test_vec_dot_q2_K(int n, const void *x, const void *y, float *s);
+void ds4_test_vec_dot_q4_K(int n, const void *x, const void *y, float *s);
+void ds4_test_vec_dot_q8_K(int n, const void *x, const void *y, float *s);
+void ds4_test_vec_dot_q8_K_pair(int n, const void *x0, const void *x1,
+                                const void *y, float *s0, float *s1);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

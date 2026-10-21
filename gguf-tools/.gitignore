@@ -1,5 +1,6 @@
 deepseek4-quantize
 gguf-requantize-dense
+ds4-requant
 quality-testing/score_official
 quality-testing/score_llama
 quality-testing/data/*
