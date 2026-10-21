@@ -85,13 +85,13 @@ double ds4_tl_union_us(const ds4_tl *tl);
  * record: `v_us` 0 or a window past the wall falls back to the whole record. */
 void ds4_tl_set_view(ds4_tl *tl, uint32_t v0_us, uint32_t v_us);
 
-/* Paint `lane` into `cols` columns over the drawn window, NUL-terminated. A
- * column is blank, `light`, `mid` or `heavy` by how much of it the lane covers:
- * a token has thousands of 2 us launches, and a solid bar would claim a duty
- * cycle the lane does not have. Returns the number of painted columns.
- * Adjacent spans that meet inside one column paint that column once. */
-int  ds4_tl_paint(const ds4_tl *tl, int lane, int cols, char light, char mid,
-                  char heavy, char blank, char *out);
+/* Fill `level` with one level per column over the drawn window: 0 for a
+ * column the lane does not touch, 1 to 3 by how much of it the lane covers.
+ * A token has thousands of 2 us launches, so a level of presence alone would
+ * claim a duty cycle the lane does not have. Returns the number of columns with
+ * a level above 0; adjacent spans that meet inside one column count once. The
+ * module stays text-free: the caller picks the glyph for each level. */
+int  ds4_tl_paint(const ds4_tl *tl, int lane, int cols, unsigned char *level);
 
 #ifdef __cplusplus
 }

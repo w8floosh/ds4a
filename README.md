@@ -297,11 +297,12 @@ reader; new records are counted and appear on `u` or when decoding stops.
 The detail page of a token or prefill chunk opens with a timeline: one row
 per lane — CPU launch, each device, bytes in flight, host blocked — on the
 record's own millisecond axis, so overlapping work is visible as rows filled at
-the same column. Shading is the lane's duty in that column, and each lane drops
-the time a more specific lane already covers, so a read that blocked the CPU is
-counted once. `t` opens the timeline full width (with `+`/`-` zoom and
-Left/Right panning, since a 2 µs launch is invisible in a whole-token view), and
-`Ctrl-Y` copies it.
+the same column. A bar's weight is the lane's duty in that column, and each
+lane drops the time a more specific lane already covers, so a read that blocked
+the CPU is counted once. A device-efficiency line reports what share of the
+token the GPUs were working and what they spent waiting for bytes. `t` opens the
+timeline full width (with `+`/`-` zoom and Left/Right panning, since a 2 µs
+launch is invisible in a whole-token view), and `Ctrl-Y` copies it.
 
 `Ctrl-B` enables breakpoint mode: the engine pauses after each token or prefill
 chunk so the profiler can be inspected; `Space` continues, `b` disables and

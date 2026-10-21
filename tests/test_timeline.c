@@ -81,23 +81,23 @@ int main(void) {
         ds4_tl_push(&tl, DS4_TL_HOST, 0, 5);            /* 0.5% of the token */
         ds4_tl_push(&tl, DS4_TL_HOST, 500, 1000);       /* half of it        */
         ds4_tl_normalize(&tl);
-        char out[64];
-        int painted = ds4_tl_paint(&tl, DS4_TL_HOST, 20, '.', ':', '#', ' ', out);
+        unsigned char out[64];
+        int painted = ds4_tl_paint(&tl, DS4_TL_HOST, 20, out);
         check(painted > 0, "painted something");
-        check(strlen(out) == 20, "one glyph per column");
-        check(out[0] == '.', "a sliver is the light glyph");
-        check(out[19] == '#', "a full column is the heavy glyph");
+        check(out[0] == 1, "a sliver is the light level");
+        check(out[19] == 3, "a full column is the heavy level");
+        check(out[5] == 0, "an untouched column has no level");
 
         ds4_tl back;
         ds4_tl_init(&back, 1000);
         ds4_tl_push(&back, DS4_TL_WAIT, 0, 500);
         ds4_tl_push(&back, DS4_TL_WAIT, 500, 1000);
         ds4_tl_normalize(&back);
-        ds4_tl_paint(&back, DS4_TL_WAIT, 10, '.', ':', '#', ' ', out);
+        ds4_tl_paint(&back, DS4_TL_WAIT, 10, out);
         int full = 0;
-        for (int i = 0; i < 10; i++) if (out[i] == '#') full++;
+        for (int i = 0; i < 10; i++) if (out[i] == 3) full++;
         check(full == 10, "a lane busy end to end is solid, no seam");
-        check(ds4_tl_paint(&back, DS4_TL_HOST, 10, '.', ':', '#', ' ', out) == 0,
+        check(ds4_tl_paint(&back, DS4_TL_HOST, 10, out) == 0,
               "empty lane paints nothing");
     }
 
@@ -109,15 +109,15 @@ int main(void) {
         ds4_tl_push(&tl, DS4_TL_DEV0, 0, 200);
         ds4_tl_push(&tl, DS4_TL_DEV0, 800, 1000);
         ds4_tl_normalize(&tl);
-        char out[64];
-        check(ds4_tl_paint(&tl, DS4_TL_DEV0, 10, '.', ':', '#', ' ', out) == 4,
+        unsigned char out[64];
+        check(ds4_tl_paint(&tl, DS4_TL_DEV0, 10, out) == 4,
               "whole token shows both stretches");
-        check(out[0] == '#' && out[9] == '#' && out[5] == ' ',
+        check(out[0] == 3 && out[9] == 3 && out[5] == 0,
               "both ends busy, the middle idle");
         ds4_tl_set_view(&tl, 700, 300);
-        ds4_tl_paint(&tl, DS4_TL_DEV0, 10, '.', ':', '#', ' ', out);
-        check(out[9] == '#', "zoomed window shows the end stretch only");
-        check(out[0] == ' ', "zoomed window drops what is left of it");
+        ds4_tl_paint(&tl, DS4_TL_DEV0, 10, out);
+        check(out[9] == 3, "zoomed window shows the end stretch only");
+        check(out[0] == 0, "zoomed window drops what is left of it");
         ds4_tl_set_view(&tl, 5000, 100);
         check(tl.v0_us == 900 && tl.v_us == 100, "pan is clamped to the record");
         ds4_tl_set_view(&tl, 0, 0);

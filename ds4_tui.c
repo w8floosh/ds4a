@@ -2053,6 +2053,24 @@ static void timeline_build(ds4_tui *t) {
     timeline_note_neighbours(t);
 }
 
+/* One glyph per column: four weights of the same bar. A column the lane does
+ * not touch is a space, so a lane still reads as a bar chart rather than as
+ * text, and its weight is the share of that column the lane was busy. */
+static void tl_paint_row(const ds4_tl *tl, int lane, int cols, char *out) {
+    static const char *const lvl[4] = { " ", "\u2591", "\u2592", "\u2588" };
+    unsigned char level[512];
+    if (cols > 512) cols = 512;
+    ds4_tl_paint(tl, lane, cols, level);
+    int w = 0;
+    for (int c = 0; c < cols; c++) {
+        const char *g = lvl[level[c] <= 3 ? level[c] : 3];
+        const size_t n = strlen(g);
+        memcpy(out + w, g, n);
+        w += (int)n;
+    }
+    out[w] = '\0';
+}
+
 /* A label row for the axis: tick times in milliseconds, placed under the
  * columns they belong to. Wide panes get more ticks instead of longer labels. */
 static void tl_axis_row(uint32_t v0_us, uint32_t v_us, int cols, int wide,
@@ -2082,7 +2100,7 @@ static void timeline_render(ds4_tui *t, tui_doc *d, int width, int wide) {
     int cols = width - labelw - suffix;
     if (cols < 8) cols = 8;
     if (cols > 500) cols = 500;
-    char bar[512], axis[512];
+    char bar[512 * 3 + 1], axis[512];
     const uint32_t wall_us = t->tl_wall_us;
 
     if (t->detail_event_n == 0) {
@@ -2105,7 +2123,7 @@ static void timeline_render(ds4_tui *t, tui_doc *d, int width, int wide) {
     for (int i = 0; i < TUI_TL_LANES; i++) {
         const int lane = k_tl_lanes[i].lane;
         if (ds4_tl_count(&t->tl, lane) == 0) continue;
-        ds4_tl_paint(&t->tl, lane, cols, '.', ':', '#', ' ', bar);
+        tl_paint_row(&t->tl, lane, cols, bar);
         const double ms = ds4_tl_lane_us(&t->tl, lane) / 1000.0;
         /* Zoomed in, the bar is a slice but the number stays the lane's total
          * for the token: say so, or the two read as the same measurement. */
@@ -2174,12 +2192,32 @@ static void timeline_render(ds4_tui *t, tui_doc *d, int width, int wide) {
                  wall_ms > 0 ? 100.0 * covered / wall_ms : 0.0, gap);
         doc_blocks(t, d, 1, 40);
     }
+    /* Device efficiency: the share of the record the devices spent doing work.
+     * Idle device time is the process' loss -- bytes that had not arrived yet,
+     * or a host thread that could not feed them -- so this is the number a
+     * change to streaming or scheduling has to move. */
+    {
+        const double busy_us = ds4_tl_lane_us(&t->tl, DS4_TL_DEV0) +
+                               ds4_tl_lane_us(&t->tl, DS4_TL_DEV1) -
+                               ds4_tl_overlap_us(&t->tl, DS4_TL_DEV0,
+                                                 DS4_TL_DEV1);
+        const double wall_ms = (double)wall_us / 1000.0;
+        const double busy_ms = busy_us / 1000.0;
+        const double idle_ms = wall_ms > busy_ms ? wall_ms - busy_ms : 0.0;
+        if (ds4_tl_count(&t->tl, DS4_TL_DEV0) + ds4_tl_count(&t->tl, DS4_TL_DEV1) > 0)
+            doc_line(d, ST_GRAY,
+                     " device efficiency %.0f%%: busy %.1f ms, waiting %.1f of"
+                     " %.1f ms%s", wall_ms > 0 ? 100.0 * busy_ms / wall_ms : 0.0,
+                     busy_ms, idle_ms, wall_ms,
+                     v_us < wall_us ? " all" : "");
+    }
     doc_line(d, ST_GRAY, " lanes: host=CPU launch, gpu*=device busy, xfer=bytes in"
              " flight, wait=host blocked by a sync; each lane drops the time a"
              " more specific lane already covers");
-    doc_line(d, ST_GRAY, " shading is duty in the column: . <25%%, : 25-75%%, # >75%%;"
-             " %.1f-%.1f ms of %.1f", (double)v0 / 1000.0,
-             (double)(v0 + v_us) / 1000.0, (double)wall_us / 1000.0);
+    doc_line(d, ST_GRAY, " bar weight is the lane's duty in the column:"
+             " \u2591 <25%%, \u2592 25-75%%, \u2588 >75%%; %.1f-%.1f ms of %.1f",
+             (double)v0 / 1000.0, (double)(v0 + v_us) / 1000.0,
+             (double)wall_us / 1000.0);
     if (t->tl_note[0]) doc_line(d, ST_GRAY, "%s", t->tl_note);
     if (wide && t->detail_open_xfer)
         doc_line(d, ST_YELLOW,
@@ -2604,8 +2642,13 @@ static void build_help(ds4_tui *t) {
                  "Each lane drops the time a more specific lane already covers, so "
                  "a read that blocked the CPU is counted once; transfers that run "
                  "beside the compute stay in both, because that overlap is the "
-                 "point. t opens it full width, where +/- zoom to single stages "
-                 "and Left/Right pan.");
+                 "point. Device efficiency is the share of the record the "
+                 "devices spent working: the rest is device time lost to bytes "
+                 "that had not arrived, which is what a streaming or scheduling "
+                 "change has to move. Capture is on for this view and every "
+                 "stage boundary syncs, so the figure is a floor: without "
+                 "capture the device pipelines more work. t opens it full width, "
+                 "where +/- zoom to single stages and Left/Right pan.");
         break;
     case PV_DEVICES:
         para_put(d, ST_GRAY,

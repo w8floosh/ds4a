@@ -159,11 +159,9 @@ double ds4_tl_union_us(const ds4_tl *tl) {
     return sum;
 }
 
-int ds4_tl_paint(const ds4_tl *tl, int lane, int cols, char light, char mid,
-                 char heavy, char blank, char *out) {
-    if (!out || cols <= 0) return 0;
-    for (int c = 0; c < cols; c++) out[c] = blank;
-    out[cols > 0 ? cols : 0] = '\0';
+int ds4_tl_paint(const ds4_tl *tl, int lane, int cols, unsigned char *level) {
+    if (!level || cols <= 0) return 0;
+    memset(level, 0, (size_t)cols);
     if (!tl || lane < 0 || lane >= DS4_TL_NLANES) return 0;
     const ds4_tl_lane *l = &tl->lane[lane];
     if (l->n <= 0) return 0;
@@ -172,13 +170,11 @@ int ds4_tl_paint(const ds4_tl *tl, int lane, int cols, char light, char mid,
     const uint32_t v0 = tl->v0_us;
     const uint32_t v = tl->v_us ? tl->v_us : wall;
     /* Coverage per column: the share of the column's own time the lane was
-     * busy, in 1/64ths. A span shorter than a column paints a light glyph, a
-     * span that fills it a heavy one, so 3000 launches never read as a solid
-     * bar. Spans in a lane are merged first, so their coverage never overlaps
-     * and the sum below cannot count the same instant twice. */
+     * busy, in 1/64ths. Spans in a lane are merged first, so their coverage
+     * never overlaps and the sum below cannot count the same instant twice. */
     uint32_t cov[512];
     if (cols > 512) cols = 512;
-    for (int c = 0; c < cols; c++) cov[c] = 0;
+    memset(cov, 0, sizeof(cov[0]) * (size_t)cols);
     const double colw = (double)v / (double)cols;
     for (int i = 0; i < l->n; i++) {
         const double a = (double)l->span[i].t0_us - (double)v0;
@@ -202,7 +198,7 @@ int ds4_tl_paint(const ds4_tl *tl, int lane, int cols, char light, char mid,
     int painted = 0;
     for (int c = 0; c < cols; c++) {
         if (!cov[c]) continue;
-        out[c] = cov[c] >= 48u ? heavy : cov[c] >= 16u ? mid : light;
+        level[c] = (unsigned char)(cov[c] >= 48u ? 3 : cov[c] >= 16u ? 2 : 1);
         painted++;
     }
     return painted;
