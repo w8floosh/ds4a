@@ -2080,21 +2080,25 @@ static void build_profiler(ds4_tui *t) {
  * explanation inside the profiler pane lives here instead: the pane needs its
  * columns for numbers, and this card can follow whichever view is on screen.
  * It is rebuilt per frame, which is cheap because it is a few dozen lines. */
+/* One paragraph, wrapped by the help pane rather than by hand: the card is as
+ * wide as the terminal, and text pre-split at 70 columns left its right half
+ * empty on every wide window. */
+static void para_put(tui_doc *d, uint8_t style, const char *text) {
+    doc_line(d, style, "%s", text);
+}
+
 static void build_help(ds4_tui *t) {
     tui_doc *d = &t->help;
     doc_clear(d);
-    doc_line(d, ST_TITLE, " profiler: %s", view_name(t->pv));
+    doc_line(d, ST_TITLE, "profiler: %s", view_name(t->pv));
     switch (t->pv) {
     case PV_TOKENS:
-        doc_line(d, ST_GRAY,
-                 " One record per decoded token (D) or prefill chunk (P), newest");
-        doc_line(d, ST_GRAY,
-                 " first. The list is frozen while generating so it cannot slide");
-        doc_line(d, ST_GRAY,
-                 " under the reader; u loads what arrived since. Hot stage is the");
-        doc_line(d, ST_GRAY,
-                 " largest measured stage of the selected record, not a");
-        doc_line(d, ST_GRAY, " measurement of its own.");
+        para_put(d, ST_GRAY,
+                 "One record per decoded token (D) or prefill chunk (P), newest "
+                 "first. The list is frozen while generating so it cannot slide "
+                 "under the reader; u loads what arrived since. Hot stage is the "
+                 "largest measured stage of the selected record, not a "
+                 "measurement of its own.");
         if (t->view) {
             const ds4_prof_record_meta *m = sel_meta(t);
             if (m && m->hot_stage < (uint16_t)t->view->n_stages)
@@ -2104,81 +2108,70 @@ static void build_help(ds4_tui *t) {
         }
         break;
     case PV_DETAIL:
-        doc_line(d, ST_GRAY,
-                 " total = CPU launch time + device wait, so a stage never hides");
-        doc_line(d, ST_GRAY,
-                 " what its own launch cost. Stage times are per-device wall");
-        doc_line(d, ST_GRAY,
-                 " clock: one record runs on two GPUs at once, so their sum can");
-        doc_line(d, ST_GRAY,
-                 " exceed the record wall. The residual is sampling, detokenising");
-        doc_line(d, ST_GRAY,
-                 " and the gaps between stages. Expert uses show where a weight");
-        doc_line(d, ST_GRAY, " lived (source) and the device that ran it (from -> to).");
+        para_put(d, ST_GRAY,
+                 "total = CPU launch time + device wait, so a stage never hides "
+                 "what its own launch cost. Stage times are per-device wall "
+                 "clock: one record runs on two GPUs at once, so their sum can "
+                 "exceed the record wall. The residual is sampling, detokenising "
+                 "and the gaps between stages. Expert uses show where a weight "
+                 "lived (source) and the device that ran it (from -> to).");
         break;
     case PV_DEVICES:
-        doc_line(d, ST_GRAY,
-                 " Bars are the current value, the spark line the last 60 samples");
-        doc_line(d, ST_GRAY,
-                 " and the whole row the last 24. VRAM and RAM are used of total");
-        doc_line(d, ST_GRAY,
-                 " on that device and on the host; the SSD spark is scaled to");
-        doc_line(d, ST_GRAY, " 2 GB/s so a slow disk still shows its shape.");
+        para_put(d, ST_GRAY,
+                 "A spark strip is that series' recent history, scaled to its own "
+                 "peak, with the current value on the right. VRAM and RAM are used "
+                 "of total on that device and on the host; the SSD strip is scaled "
+                 "to a fixed 2 GB/s so a slow disk still shows its shape.");
         break;
     case PV_EXPERTS:
-        doc_line(d, ST_GRAY,
-                 " Every expert lives in exactly one tier: VRAM on a GPU, the");
-        doc_line(d, ST_GRAY,
-                 " pinned host arena in RAM, or the SSD. Routing lists, for the");
-        doc_line(d, ST_GRAY,
-                 " selected token, where each expert was read from and where it");
-        doc_line(d, ST_GRAY,
-                 " ran. Arena hits were served from RAM, admissions are misses");
-        doc_line(d, ST_GRAY,
-                 " that took an empty slot, evictions reclaim a slot when full.");
+        para_put(d, ST_GRAY,
+                 "Every expert lives in exactly one tier: VRAM on a GPU, the "
+                 "pinned host arena in RAM, or the SSD. Routing lists, for the "
+                 "selected token, where each expert was read from and where it "
+                 "ran. Arena hits were served from RAM, admissions are misses "
+                 "that took an empty slot, evictions reclaim a slot when full.");
         break;
     default:
-        doc_line(d, ST_GRAY,
-                 " D/P are averages since the last reset (r); ms/token is the whole");
-        doc_line(d, ST_GRAY,
-                 " decode record, so that is the latency that matters. Stage rows");
-        doc_line(d, ST_GRAY,
-                 " are per-device wall clock of one kind only: the two GPUs overlap");
-        doc_line(d, ST_GRAY,
-                 " inside one token, so their sum can pass the wall and each share");
-        doc_line(d, ST_GRAY,
-                 " is of that kind's own total. Capture (p) serialises the GPU, so");
-        doc_line(d, ST_GRAY, " tok/s reads low while it is on.");
+        para_put(d, ST_GRAY,
+                 "D/P are averages since the last reset (r); ms/token is the whole "
+                 "decode record, so that is the latency that matters. Cost rows are "
+                 "per-device wall clock, and the gpu, transfer and wait rows overlap "
+                 "the compute rows, so a column adds up to named work rather than to "
+                 "the wall and each share is of its own kind's total. Capture (p) "
+                 "serialises the GPU, so tok/s reads low while it is on.");
         break;
     }
     doc_line(d, ST_NORMAL, "");
-    doc_line(d, ST_TITLE, " keys");
-    doc_line(d, ST_GRAY, " profiler keys need the profiler pane focused (Alt-2).");
-    doc_line(d, ST_NORMAL, " Tab / Shift-Tab   cycle the four panes");
-    doc_line(d, ST_NORMAL, " Alt-1 .. Alt-4    chat, profiler, console, help");
-    doc_line(d, ST_NORMAL, " Up / Down         move the row cursor");
-    doc_line(d, ST_NORMAL, " PgUp / PgDn       scroll the pane; the cursor never blocks it");
-    doc_line(d, ST_NORMAL, " Home / End        cursor to the first / last row");
-    doc_line(d, ST_NORMAL, " 1 .. 5            overview, tokens, detail, devices, experts");
-    doc_line(d, ST_NORMAL, " Enter             open the selected token or chunk");
-    doc_line(d, ST_NORMAL, " Esc               detail back to the list; leave help/console");
-    doc_line(d, ST_NORMAL, " f                 record filter: decode, prefill, all");
-    doc_line(d, ST_NORMAL, " [ / ]             newer / older page of records");
-    doc_line(d, ST_NORMAL, " u                 load records created while generating");
-    doc_line(d, ST_NORMAL, " g / G             jump to the start / end");
-    doc_line(d, ST_NORMAL, " p                 stage capture on / off");
-    doc_line(d, ST_NORMAL, " r                 reset the profiler aggregates");
-    doc_line(d, ST_NORMAL, " Ctrl-B            breakpoints: pause after each token/chunk");
-    doc_line(d, ST_NORMAL, " Space / c / b     continue; b also drops breakpoints");
-    doc_line(d, ST_NORMAL, " ?                 this card, from any pane");
-    doc_line(d, ST_NORMAL, " Ctrl-Y            copy the focused pane to the clipboard");
-    doc_line(d, ST_NORMAL, " Y (profiler)      copy the whole view, all pages, one text");
-    doc_line(d, ST_NORMAL, " chat: Enter sends, Ctrl-P/N move in the transcript,");
-    doc_line(d, ST_NORMAL, " Ctrl-U pages it, Ctrl-C clears the line, Ctrl-D exits.");
-    doc_line(d, ST_GRAY, " Chat takes bracketed pastes: multi-line text arrives as");
-    doc_line(d, ST_GRAY, " one line, so a paste never runs the UI's keys.");
-    doc_line(d, ST_GRAY, " A row wider than its pane slides sideways while it is the");
-    doc_line(d, ST_GRAY, " selected row, and returns to column 0 when it is not.");
+    doc_line(d, ST_TITLE, "keys");
+    doc_line(d, ST_GRAY, "profiler keys need the profiler pane focused (Alt-2).");
+    doc_line(d, ST_NORMAL, "Tab / Shift-Tab   cycle the four panes");
+    doc_line(d, ST_NORMAL, "Alt-1 .. Alt-4    chat, profiler, console, help");
+    doc_line(d, ST_NORMAL, "Up / Down         move the row cursor");
+    doc_line(d, ST_NORMAL, "PgUp / PgDn       scroll the pane; the cursor never blocks it");
+    doc_line(d, ST_NORMAL, "Home / End        cursor to the first / last row");
+    doc_line(d, ST_NORMAL, "1 .. 5            overview, tokens, detail, devices, experts");
+    doc_line(d, ST_NORMAL, "Enter             open the selected token or chunk");
+    doc_line(d, ST_NORMAL, "Esc               detail back to the list; leave help/console");
+    doc_line(d, ST_NORMAL, "f                 record filter: decode, prefill, all");
+    doc_line(d, ST_NORMAL, "[ / ]             newer / older page of records");
+    doc_line(d, ST_NORMAL, "u                 load records created while generating");
+    doc_line(d, ST_NORMAL, "g / G             jump to the start / end");
+    doc_line(d, ST_NORMAL, "p                 stage capture on / off");
+    doc_line(d, ST_NORMAL, "r                 reset the profiler aggregates");
+    doc_line(d, ST_NORMAL, "Ctrl-B            breakpoints: pause after each token/chunk");
+    doc_line(d, ST_NORMAL, "Space / c / b     continue; b also drops breakpoints");
+    doc_line(d, ST_NORMAL, "?                 this card, from any pane");
+    doc_line(d, ST_NORMAL, "Ctrl-Y            copy the focused pane to the clipboard");
+    doc_line(d, ST_NORMAL, "Y (profiler)      copy the whole view, all pages, one text");
+    para_put(d, ST_NORMAL,
+             " chat: Enter sends, Ctrl-P/N move in the transcript, Ctrl-U pages it, "
+             "Ctrl-C clears the line, Ctrl-D exits.");
+    para_put(d, ST_GRAY,
+             " Chat takes bracketed pastes: multi-line text arrives as one line, so "
+             "a paste never runs the UI's keys.");
+    para_put(d, ST_GRAY,
+             " A row wider than its pane slides sideways while it is the selected "
+             "row, and returns to column 0 when it is not.");
     if (t->pv == PV_DETAIL && t->view && t->detail_ready && t->detail.stage_n) {
         doc_line(d, ST_NORMAL, "");
         doc_line(d, ST_TITLE, " what each recorded operation means");
@@ -2322,7 +2315,10 @@ void ds4_tui_redraw(ds4_tui *t) {
                           &t->hoff, &t->hoff_t, &help_slide, now,
                           t->focus == DS4_TUI_HELP && reveal_cur };
     draw_doc(&t->scr, &t->msg, 1, msg_y + 1, chat_w - 2, msg_h - 2, &msg_pv);
-    draw_doc(&t->scr, &t->help, prof_x + 1, msg_y + 1, prof_w - 2, msg_h - 2,
+    /* The help card is inset by one column on each side and its rows carry no
+     * leading space: wrapped prose cannot indent its continuations, so the
+     * gutter has to come from the draw, not from the text. */
+    draw_doc(&t->scr, &t->help, prof_x + 2, msg_y + 1, prof_w - 4, msg_h - 2,
              &help_pv);
     t->slide = chat_slide || prof_slide || msg_slide || help_slide;
 
