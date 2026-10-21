@@ -163,10 +163,10 @@ static const struct {
         "Copying routed-expert partial outputs from the second GPU back to the primary.", "transfer"},
     [DS4_PSTEP_XFER_KV]           = {"xfer_kv", "KV cache expansion",
         "Expanding the compressed (F16) KV cache to F32 for attention, every layer, every token.", "transfer"},
-    [DS4_PSTEP_XFER_ACT_HOST]     = {"xfer_act_host", "Transfers: activations to device",
+    [DS4_PSTEP_XFER_ACT_HOST]     = {"xfer_act_host", "Transfers: activations in",
         "Activation or control tensors copied host-to-device: router ids, weights, handoff buffers. Measured copy time and bytes.",
         "transfer"},
-    [DS4_PSTEP_XFER_ACT_READBACK] = {"xfer_act_readback", "Transfers: activations from device",
+    [DS4_PSTEP_XFER_ACT_READBACK] = {"xfer_act_readback", "Transfers: activations out",
         "Activation, partial-result or id tensors copied device-to-host. The blocking time is also charged to the readback wait row.",
         "transfer"},
 

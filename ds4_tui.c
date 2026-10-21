@@ -1077,14 +1077,33 @@ static char kind_char(uint8_t k) {
     }
 }
 
-static void bar(sbuf *b, double v, double max, int width, const char *color) {
-    (void)color;
-    int n = max > 0 ? (int)((v / max) * width + 0.5) : 0;
-    if (n < 0) n = 0;
-    if (n > width) n = width;
-    sb_puts(b, "[");
-    for (int i = 0; i < width; i++) sb_puts(b, i < n ? "#" : "-");
-    sb_puts(b, "]");
+/* Stage categories in the order the cost table prints them, with the section
+ * title it uses. Every stage belongs to exactly one entry (anything the engine
+ * registers under a name not listed here falls in the last bucket), which is
+ * what makes the rows of a column add up to its total row. The gpu, transfer
+ * and wait steps are listed too: they are stages like any other, and leaving
+ * them out was what made the printed rows cover half the printed total. */
+static const struct { const char *key, *title; } k_cost_cats[] = {
+    {"attention", "attention"},
+    {"routed", "routed"},
+    {"shared", "shared"},
+    {"router", "router"},
+    {"indexer", "indexer"},
+    {"norm and mixing", "norm and mixing"},
+    {"output", "output"},
+    {"sampling", "sampling"},
+    {"device", "gpu steps (overlap the rows above)"},
+    {"transfer", "transfers"},
+    {"wait", "stalls and waits"},
+    {"host", "host steps"},
+    {"", "other"},
+};
+#define COST_CATS ((int)(sizeof(k_cost_cats) / sizeof(k_cost_cats[0])))
+
+static int cost_cat(const char *category) {
+    for (int i = 0; i + 1 < COST_CATS; i++)
+        if (!strcmp(category, k_cost_cats[i].key)) return i;
+    return COST_CATS - 1;
 }
 
 /* 8-level sparkline. Zero values render as a baseline dot. */
@@ -1152,33 +1171,24 @@ static int row_spark_len(int w, const char *label) {
 }
 
 /* A live strip: label, as much history as the column can hold, current value
- * right aligned. Sized from the block width so a wide pane shows a longer
- * history instead of leaving the right half of the box empty. */
+ * right aligned. Every part is sized from the block width, so the row is
+ * exactly as wide as the column: a long value like "2.243 GiB/s" takes room
+ * from the history instead of moving itself to the next line and shifting
+ * every row below it. */
 static void spark_line(tui_block *b, const char *label, const double *v, int n,
                        double max, const char *value, const char *color) {
-    int sp = b->w - 26;
+    int vw = (int)strlen(value);
+    if (vw < 10) vw = 10;
+    int sp = b->w - 16 - vw;
     if (sp < 4) sp = 4;
     if (sp > n) sp = n;
     const int skip = n - sp;
     sbuf s;
     memset(&s, 0, sizeof(s));
     spark(&s, v + skip, sp, max, color);
-    doc_printf(&b->doc, ST_GRAY, "  %-12.12s ", label);
-    doc_puts(&b->doc, s.s ? s.s : "", ST_GRAY);
-    doc_printf(&b->doc, ST_GRAY, " %10s", value);
-    free(s.s);
-}
-
-/* label, bar and value on one row; the bar is as long as the column allows. */
-static void bar_row(tui_block *b, const char *label, double v, double max,
-                    const char *value) {
-    int n = b->w - 7 - (int)strlen(label) - (int)strlen(value);
-    if (n < 6) n = 6;
-    if (n > 80) n = 80;
-    sbuf s;
-    memset(&s, 0, sizeof(s));
-    bar(&s, v, max, n, "\x1b[34m");
-    doc_line(&b->doc, ST_NORMAL, "   %s %s %s", label, s.s ? s.s : "", value);
+    doc_printf(&b->doc, ST_GRAY | ST_NOWRAP, "  %-12.12s ", label);
+    doc_puts(&b->doc, s.s ? s.s : "", ST_GRAY | ST_NOWRAP);
+    doc_printf(&b->doc, ST_GRAY | ST_NOWRAP, " %10s", value);
     free(s.s);
 }
 
@@ -1191,7 +1201,7 @@ static void spark_row(tui_block *b, const char *label, const double *v, int n,
     sbuf s;
     memset(&s, 0, sizeof(s));
     spark(&s, v + skip, sp, max, color);
-    doc_line(&b->doc, ST_GRAY, "   %s %s", label, s.s ? s.s : "");
+    doc_line(&b->doc, ST_GRAY | ST_NOWRAP, "   %s %s", label, s.s ? s.s : "");
     free(s.s);
 }
 
@@ -1424,15 +1434,58 @@ static void build_overview(ds4_tui *t) {
         doc_blocks(t, d, 2, 52);
     }
 
+    /* Live strips come before the per-stage table: these are what changes every
+     * tick, and the table below them is long enough to push them off the pane.
+     * One block per series, so a wide pane shows several strips per row and
+     * each strip shows as much history as its column holds. */
+    doc_line(d, ST_TITLE, " Live history");
+    {
+        const int nb = 3 + v->dev_n;
+        double series[TUI_HIST] = {0};
+        for (int i = 0; i < nb; i++) {
+            tui_block *b = block_alloc(t, nb, 40, i);
+            int ns = b->w - 26;
+            if (ns < 4) ns = 4;
+            if (ns > t->h_n) ns = t->h_n;
+            char val[64], lbl[24];
+            if (i == 0) {
+                hist_series(t, t->h_tps, series, ns);
+                snprintf(val, sizeof(val), "%.0f t/s", ns ? series[ns - 1] : 0.0);
+                spark_line(b, "decode tok/s", series, ns, series_max(series, ns),
+                           val, "\x1b[32m");
+            } else if (i == 1) {
+                hist_series(t, t->h_ms, series, ns);
+                snprintf(val, sizeof(val), "%.2f ms", ns ? series[ns - 1] : 0.0);
+                spark_line(b, "token ms", series, ns, series_max(series, ns),
+                           val, "\x1b[31m");
+            } else if (i == 2) {
+                hist_series(t, t->h_ssd, series, ns);
+                char bs[32];
+                ds4_profiler_format_bytes(bs, sizeof(bs),
+                    (uint64_t)(ns ? series[ns - 1] : 0.0));
+                snprintf(val, sizeof(val), "%s/s", bs);
+                spark_line(b, "SSD read", series, ns, series_max(series, ns),
+                           val, "\x1b[33m");
+            } else {
+                const int dv = i - 3;
+                hist_series_u8(t, t->h_util[dv], series, ns);
+                snprintf(val, sizeof(val), "%.0f%%", ns ? series[ns - 1] : 0.0);
+                snprintf(lbl, sizeof(lbl), "GPU%d util", v->dev[dv].device);
+                spark_line(b, lbl, series, ns, 100, val, "\x1b[36m");
+            }
+        }
+        doc_blocks(t, d, nb, 40);
+    }
     /* Cost per token by stage. Decode and prefill run the same stage boundaries
      * with wildly different durations, so each is tabulated on its own kind and
      * never averaged across kinds: that was what made two rows share a label
-     * with two different values. The transfers table joins the band because it
-     * answers the same question (what the token time is spent on). */
+     * with two different values. Every stage the engine measured is printed
+     * under its category, gpu steps and transfers included, so the rows of a
+     * column add up to its total row and the shares to 100%: the gpu, transfer
+     * and wait rows overlap the compute rows, so the total is named work, not
+     * the token wall. */
     doc_line(d, ST_TITLE, " Cost per token by stage");
     {
-        const char *cats[] = {"attention", "routed", "shared", "router", "indexer",
-                              "norm and mixing", "output", "other"};
         double sums[2] = {0, 0};
         for (int pass = 0; pass < 2; pass++) {
             const int kind = pass == 0 ? DS4_PREC_DECODE_TOKEN : DS4_PREC_PREFILL_CHUNK;
@@ -1444,80 +1497,79 @@ static void build_overview(ds4_tui *t) {
         for (int pass = 0; pass < 2; pass++) {
             if (sums[pass] <= 0) continue;
             const int kind = pass == 0 ? DS4_PREC_DECODE_TOKEN : DS4_PREC_PREFILL_CHUNK;
-            const char *kname = pass == 0 ? "decode token" : "prefill chunk";
             const double units = pass == 0 ? (double)tm->tokens
                                            : (double)tm->prefill_tokens;
             const double ksum = sums[pass];
-            tui_block *b = block_alloc(t, pass_n + 1, 74, nblk++);
+            tui_block *b = block_alloc(t, pass_n, 74, nblk++);
             tui_doc *bd = &b->doc;
             const int wide = b->w >= 88;
             const int mid = b->w >= 74;
-            const int lw = b->w >= 40 ? 18 : 12;
-            doc_line(bd, ST_CYAN, " %s  (%.3f ms each, n=%.0f)", kname,
+            /* A narrow column keeps the three numbers and drops the rest; the
+             * label takes whatever is left so a row never wraps into the next
+             * one: 2 + label + 3 * (1 + 5) + 1 + 6 == the block width. */
+            const int lw = b->w - 26 >= 18 ? 18 : (b->w - 26 >= 10 ? b->w - 26 : 10);
+            doc_line(bd, ST_CYAN, " %s  (%.3f ms each, n=%.0f)",
+                     pass == 0 ? "decode token" : "prefill chunk",
                      units > 0 ? ksum / units : 0, units);
             if (wide)
                 doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
-                          "  stage                         total    launch     wait"
-                          "   calls/tok   bytes/tok");
+                          "  stage                          total   launch"
+                          "     wait  calls/tok   bytes/tok");
             else if (mid)
                 doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
-                          "  stage                         total    launch     wait"
-                          "   calls/tok");
+                          "  stage                          total   launch"
+                          "     wait  calls/tok");
             else
-                doc_line(bd, ST_GRAY, "  stage             total launch  wait shr");
+                doc_line(bd, ST_GRAY, "  %-*.*s %5.5s %5.5s %5.5s",
+                         lw, lw, "stage", "total", "laun", "wait");
             int shown = 0;
-            for (size_t ci = 0; ci < sizeof(cats) / sizeof(cats[0]); ci++) {
+            for (int ci = 0; ci < COST_CATS; ci++) {
                 int any = 0;
                 for (int i = 0; i < v->n_stages; i++)
-                    if (!strcmp(v->stages[i].category, cats[ci]) &&
+                    if (cost_cat(v->stages[i].category) == ci &&
                         v->stages[i].kind[kind].total_ms > 0)
                         any = 1;
                 if (!any) continue;
-                doc_line(bd, ST_CYAN, "  %s", cats[ci]);
+                doc_line(bd, ST_CYAN, "  %s", k_cost_cats[ci].title);
                 for (int i = 0; i < v->n_stages; i++) {
                     const ds4_prof_stage_view *s = &v->stages[i];
                     const ds4_prof_stage_kind *k = &s->kind[kind];
-                    if (strcmp(s->category, cats[ci]) || k->total_ms <= 0) continue;
+                    if (cost_cat(s->category) != ci || k->total_ms <= 0) continue;
                     const double total = units > 0 ? k->total_ms / units : 0;
                     const double enc = units > 0 ? k->encode_ms / units : 0;
                     const double wait = units > 0 ? k->wait_ms / units : 0;
                     const double calls = units > 0 ? (double)k->calls / units : 0;
-                    const double share = 100.0 * k->total_ms / ksum;
+                    char shr[24];
+                    snprintf(shr, sizeof(shr), "  %5.1f%%",
+                             ksum > 0 ? 100.0 * k->total_ms / ksum : 0);
                     if (wide) {
-                        char bs[24], shr[24];
+                        char bs[24];
                         ds4_profiler_format_bytes(bs, sizeof(bs),
-                            units > 0 ? (uint64_t)(k->bytes / (uint64_t)units) : 0);
-                        snprintf(shr, sizeof(shr), "  %5.1f%%", share);
+                            units >= 1 ? k->bytes / (uint64_t)units : 0);
                         doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
                                   "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f  %10s",
                                   s->label, total, enc, wait, calls, bs);
                     } else if (mid) {
-                        char shr[24];
-                        snprintf(shr, sizeof(shr), "  %5.1f%%", share);
                         doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
                                   "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f",
                                   s->label, total, enc, wait, calls);
                     } else {
-                        char shr[24];
-                        snprintf(shr, sizeof(shr), " %4.1f%%", share);
-                        doc_share(bd, ST_NORMAL, b->w, shr,
+                        doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
                                   "  %-*.*s %5.2f %5.2f %5.2f",
                                   lw, lw, s->label, total, enc, wait);
                     }
                     shown++;
                 }
             }
-            if (wide)
-                doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
-                          "  %-28.28s %7.3f", "total",
-                          units > 0 ? ksum / units : 0);
-            else if (mid)
-                doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
-                          "  %-28.28s %7.3f", "total",
-                          units > 0 ? ksum / units : 0);
-            else
-                doc_share(bd, ST_NORMAL, b->w, " 100.0%", "  %-*.*s %5.2f",
-                          lw, lw, "total", units > 0 ? ksum / units : 0);
+            {
+                const double tot = units > 0 ? ksum / units : 0;
+                if (wide || mid)
+                    doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
+                              "  %-28.28s %7.3f", "total", tot);
+                else
+                    doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
+                              "  %-*.*s %5.2f", lw, lw, "total", tot);
+            }
             if (!shown)
                 doc_line(bd, ST_YELLOW, "  no stage rows captured (capture is %s)",
                          t->granular ? "on" : "off");
@@ -1525,36 +1577,7 @@ static void build_overview(ds4_tui *t) {
         if (pass_n == 0)
             doc_line(d, ST_YELLOW, "  no stage rows captured (capture is %s)",
                      t->granular ? "on" : "off");
-        {
-            tui_block *b = block_alloc(t, pass_n + 1, 74, nblk++);
-            const double units = tm->tokens ? (double)tm->tokens : 0;
-            int sub = 0;
-            doc_line(&b->doc, ST_CYAN, " transfers and waits (overlap stages)");
-            for (int i = 0; i < v->n_stages; i++) {
-                const ds4_prof_stage_view *s = &v->stages[i];
-                if (strcmp(s->category, "transfer") && strcmp(s->category, "wait"))
-                    continue;
-                const ds4_prof_stage_kind *k = &s->kind[DS4_PREC_DECODE_TOKEN];
-                if (k->total_ms <= 0 && !k->bytes && !s->total_ms.n && !s->bytes)
-                    continue;
-                const double ms = units > 0 ? k->total_ms / units : 0;
-                char per[24], rate[24];
-                ds4_profiler_format_bytes(per, sizeof(per),
-                    units > 0 ? k->bytes / (uint64_t)units : 0);
-                ds4_profiler_format_bytes(rate, sizeof(rate),
-                    k->total_ms > 0 ? (uint64_t)((double)k->bytes / (k->total_ms / 1e3)) : 0);
-                {
-                    char tail[32];
-                    snprintf(tail, sizeof(tail), "  %s/s", rate);
-                    doc_share(&b->doc, ST_NORMAL, b->w, tail,
-                              "  %-30.30s %8.3f ms/tok  %10s/tok", s->label,
-                              ms, per);
-                }
-                sub++;
-            }
-            if (!sub) doc_line(&b->doc, ST_GRAY, "  none measured yet");
-        }
-        doc_blocks(t, d, pass_n + 1, 74);
+        doc_blocks(t, d, pass_n, 74);
     }
 
     /* Residency and the live device list answer related questions (where do the
@@ -1606,46 +1629,6 @@ static void build_overview(ds4_tui *t) {
         doc_blocks(t, d, 2, 46);
     }
 
-    /* Live strips: one block per series, so a wide pane shows several strips per
-     * row and each strip shows as much history as its column holds. The old
-     * fixed 24 samples were what left the right half of the box empty. */
-    {
-        const int nb = 3 + v->dev_n;
-        double series[TUI_HIST] = {0};
-        for (int i = 0; i < nb; i++) {
-            tui_block *b = block_alloc(t, nb, 40, i);
-            int ns = b->w - 26;
-            if (ns < 4) ns = 4;
-            if (ns > t->h_n) ns = t->h_n;
-            char val[64], lbl[24];
-            if (i == 0) {
-                hist_series(t, t->h_tps, series, ns);
-                snprintf(val, sizeof(val), "%.0f t/s", ns ? series[ns - 1] : 0.0);
-                spark_line(b, "decode tok/s", series, ns, series_max(series, ns),
-                           val, "\x1b[32m");
-            } else if (i == 1) {
-                hist_series(t, t->h_ms, series, ns);
-                snprintf(val, sizeof(val), "%.2f ms", ns ? series[ns - 1] : 0.0);
-                spark_line(b, "token ms", series, ns, series_max(series, ns),
-                           val, "\x1b[31m");
-            } else if (i == 2) {
-                hist_series(t, t->h_ssd, series, ns);
-                char bs[32];
-                ds4_profiler_format_bytes(bs, sizeof(bs),
-                    (uint64_t)(ns ? series[ns - 1] : 0.0));
-                snprintf(val, sizeof(val), "%s/s", bs);
-                spark_line(b, "SSD read", series, ns, series_max(series, ns),
-                           val, "\x1b[33m");
-            } else {
-                const int dv = i - 3;
-                hist_series_u8(t, t->h_util[dv], series, ns);
-                snprintf(val, sizeof(val), "%.0f%%", ns ? series[ns - 1] : 0.0);
-                snprintf(lbl, sizeof(lbl), "GPU%d util", v->dev[dv].device);
-                spark_line(b, lbl, series, ns, 100, val, "\x1b[36m");
-            }
-        }
-        doc_blocks(t, d, nb, 40);
-    }
 }
 
 static void build_tokens(ds4_tui *t) {
@@ -1958,27 +1941,26 @@ static void build_devices(ds4_tui *t) {
     doc_line(d, ST_TITLE, " Devices (nvtop style)");
     /* One card per device plus the host, laid out as blocks: a machine with two
      * GPUs and a 60 column pane stack the cards, a wide pane puts them beside
-     * each other, and the bars and strips grow with the column they get. */
+     * each other, and the strips grow with the column they get. */
     const int nb = v->dev_n + 1;
     const double ssd_peak = 2e9;
     double series[TUI_HIST];
     for (int i = 0; i < nb; i++) {
         tui_block *b = block_alloc(t, nb, 42, i);
-        char val[64];
         if (i < v->dev_n) {
             const ds4_prof_dev_state *dev = &v->dev[i];
             const char *name = dev->name;
             if (!strncmp(name, "NVIDIA GeForce ", 15)) name += 15;
             doc_line(&b->doc, ST_TITLE, " GPU%d  %s", dev->device, name);
-            snprintf(val, sizeof(val), "%3u%%", dev->util_pct);
-            bar_row(b, "util", dev->util_pct, 100, val);
             char bu[24], bt[24];
             ds4_profiler_format_bytes(bu, sizeof(bu), dev->mem_used);
             ds4_profiler_format_bytes(bt, sizeof(bt), dev->mem_total);
-            snprintf(val, sizeof(val), "%s/%s", bu, bt);
-            bar_row(b, "vram",
-                    dev->mem_total ? 100.0 * (double)dev->mem_used / (double)dev->mem_total : 0,
-                    100, val);
+            const double mem = dev->mem_total
+                ? 100.0 * (double)dev->mem_used / (double)dev->mem_total : 0;
+            /* Values sit right after their label: a number pinned to the far
+             * edge of a wide card reads as detached from what it measures. */
+            doc_line(&b->doc, ST_NORMAL, "   util  %3u%%", dev->util_pct);
+            doc_line(&b->doc, ST_NORMAL, "   vram  %s / %s  %3.0f%%", bu, bt, mem);
             int ns = row_spark_len(b->w, "recent util");
             if (ns > t->h_n) ns = t->h_n;
             hist_series_u8(t, t->h_util[i], series, ns);
@@ -1987,12 +1969,11 @@ static void build_devices(ds4_tui *t) {
             doc_line(&b->doc, ST_TITLE, " Host");
             const double ram_used = (double)v->host_ram_used;
             const double ram_total = ram_used + (double)v->host_ram_avail;
-            char bu[24], bt[24];
+            char bu[24], bt[24], bs[24];
             ds4_profiler_format_bytes(bu, sizeof(bu), (uint64_t)ram_used);
             ds4_profiler_format_bytes(bt, sizeof(bt), (uint64_t)ram_total);
-            snprintf(val, sizeof(val), "%s/%s", bu, bt);
-            bar_row(b, "RAM", ram_used, ram_total > 0 ? ram_total : 1, val);
-            char bs[24];
+            doc_line(&b->doc, ST_NORMAL, "   RAM   %s / %s  %3.0f%%", bu, bt,
+                     ram_total > 0 ? 100.0 * ram_used / ram_total : 0);
             ds4_profiler_format_bytes(bs, sizeof(bs), v->ssd_read_bytes);
             doc_line(&b->doc, ST_GRAY, "   SSD read total %s", bs);
             int ns = row_spark_len(b->w, "recent SSD");
@@ -3124,6 +3105,18 @@ static void tui_fake_feed(ds4_tui *t) {
                                 (2 + i % 2) * 100000ull, 20000, 0, 0);
         ds4_profiler_note_stage("decode", "ffn_hc_post", 1, n, 1,
                                 (2 + i % 2) * 100000ull, 20000, 0, 0);
+        /* One stage from each remaining category through the same step path the
+         * engine uses, so the fake capture exercises every row the cost table
+         * can print: gpu, transfer, wait and host. */
+        ds4_profiler_note_step(DS4_PSTEP_DEV_ATTN_SCORE,
+                               (7 + i % 3) * 100000ull, 1, 0);
+        ds4_profiler_note_step(DS4_PSTEP_XFER_EXPERT_SSD,
+                               (refill ? 6 : 1) * 100000ull, 1,
+                               refill ? 137000000ull : 0);
+        ds4_profiler_note_step(DS4_PSTEP_WAIT_UPLOAD,
+                               (refill ? 9 : 2) * 100000ull, 1, 0);
+        ds4_profiler_note_step(DS4_PSTEP_HOST_SAMPLE,
+                               (1 + i % 2) * 100000ull, 1, 0);
         for (int e = 0; e < 6; e++) {
             ds4_profiler_trace_event(DS4_PEV_ROUTE, 1, (uint16_t)((i * 6 + e) % 256), 0, 0);
             ds4_profiler_trace_expert(1, (uint16_t)((i * 6 + e) % 256),
@@ -3295,11 +3288,17 @@ void ds4_tui_status(ds4_tui *t, const char *fmt, ...) {
 
 void ds4_tui_set_busy(ds4_tui *t, int busy, const char *what) {
     if (!t) return;
+    const int was = t->busy;
     t->busy = busy ? 1 : 0;
     if (!busy) t->list_frozen = 0;
     if (busy) ds4_tui_status(t, "working: %s  (Ctrl-C stops)", what ? what : "generation");
     else t->status[0] = '\0';
     t->dirty = 1;
+    /* A turn boundary is a discrete user action, and the first engine progress
+     * event can be seconds away (first prefill chunk: layer reads, graph
+     * warm-up). Draw it now, otherwise the pane keeps showing the prompt the
+     * user just typed and the UI reads as hung. */
+    if (t->busy != was) ds4_tui_redraw(t);
 }
 
 void ds4_tui_pump(ds4_tui *t) {
