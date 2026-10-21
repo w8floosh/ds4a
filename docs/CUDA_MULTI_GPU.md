@@ -154,10 +154,11 @@ the free slots stay free and the pin simply has headroom for the misses that
 never came. Size `--expert-arena` for the worst case, not for what a short run
 touches.
 
-The dashboard's storage panel reports the arena's residency and split fetches
-(`arena_hits` / `arena_misses`), and, when runtime admission is on,
-`arena_admissions`, `arena_evictions` and `arena_evicted_fetches` — so eviction
-is something you can watch happen rather than assume.
+Residency and split fetches (`arena_hits` / `arena_misses`) are reported by the
+TUI profiler's residency block and by `--profile-dump`, along with, when runtime
+admission is on, `arena_admissions`, `arena_evictions` and
+`arena_evicted_fetches` — so eviction is something you can watch happen rather
+than assume.
 
 ## Flash tensor parallelism
 

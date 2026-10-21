@@ -79,8 +79,10 @@ reads, so this fork adds:
   (`set-clipboard on` in tmux); `Y` in the profiler copies the whole visible view
   instead of the window, so every record page and the full detail of the open
   token come along. The chat line accepts bracketed pastes as one paste instead
-  of a burst of keys. Records and events are also served as JSON to the optional browser
-  dashboard (`--dashboard-lan`/`--dashboard-bind`).
+  of a burst of keys. `--profile-dump FILE|-` writes the same numbers as text when
+  the run ends, so a scripted run can be measured without a terminal. Records and
+  events are also served as JSON to the optional browser dashboard
+  (`--dashboard-lan`/`--dashboard-bind`).
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
 * **Host-side expert page-cache budget.** Hot experts stay in the OS page cache

@@ -617,7 +617,7 @@ size_t ds4_profiler_record_dump_json(uint64_t seq, char *buf, size_t buflen);
 size_t ds4_profiler_records_dump(char *buf, size_t buflen, int kind, int limit);
 size_t ds4_profiler_records_dump_json(char *buf, size_t buflen, int kind, int limit);
 /* The whole picture in one call: rates, token split, devices, expert arena
- * occupancy and headroom, per-kind stage tables, then the newest records with
+ * reservation and fill, per-kind stage tables, then the newest records with
  * their full detail. This is what --profile-dump writes and what an external
  * process reads when it wants everything instead of poking field by field. */
 size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit);

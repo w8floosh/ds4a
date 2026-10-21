@@ -184,7 +184,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--no-tui", "Use the classic line REPL instead of the terminal UI.");
     opt(fp, c, "--dashboard-lan", "Serve the telemetry dashboard on the network (all interfaces) instead of loopback, so another machine can watch it. It has no authentication: trusted LANs only.");
     opt(fp, c, "--dashboard-bind IP", "Serve the dashboard on one IPv4 address (implies network exposure; use --dashboard-lan for all interfaces).");
-    opt(fp, c, "--profile-dump FILE|-", "Write a profiler report when the run ends: decode/prefill rates, token time split, devices, expert-arena occupancy and headroom, per-kind stage tables, then the newest records with every stage, device and expert use in full detail. - writes it to stdout.");
+    opt(fp, c, "--profile-dump FILE|-", "Write a profiler report when the run ends: decode/prefill rates, token time split, devices, expert-arena reservation and fill, per-kind stage tables, then the newest records with every stage, device and expert use in full detail. - writes it to stdout.");
     opt(fp, c, "--profile-records N", "How many records --profile-dump details in full. Default: 8");
     opt(fp, c, "--profile-kind decode|prefill|all", "Which records --profile-dump details. Default: all");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
