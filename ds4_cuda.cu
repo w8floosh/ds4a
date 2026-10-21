@@ -28451,6 +28451,20 @@ static int cuda_host_arena_resolve(uint32_t layer, uint32_t expert,
     return 1;
 }
 
+/* Residency probe with no side effects: the profiler needs to know where the
+ * bytes of a miss came from, but the hit accounting (and the eviction vote that
+ * goes with it) belongs to the load path only. */
+static int cuda_host_arena_resident(uint32_t layer, uint32_t expert) {
+    if (!g_host_arena.enabled || !g_host_arena.index ||
+        layer >= DS4_CUDA_EXPERT_POOL_MAX_LAYERS ||
+        expert >= g_host_arena.n_total_expert) {
+        return 0;
+    }
+    const int32_t slot = g_host_arena.index[
+        (size_t)layer * g_host_arena.n_total_expert + expert];
+    return slot >= 0 && (uint32_t)slot < g_host_arena.slot_count;
+}
+
 /* Drop the least-frequently-used resident expert and hand back its slot.
  * Slots resolved as hits for the layer being loaded are never chosen: the
  * async H2D uploads read straight out of the arena, so evicting one mid-layer
@@ -28534,7 +28548,14 @@ static int cuda_host_arena_reserve(uint32_t layer, uint32_t expert,
     if (g_host_arena.index[key] >= 0) return 0;        /* already resident */
     uint8_t *score = &g_host_arena.seen_score[key];
     if (*score < 255) (*score)++;
-    if (*score < g_host_arena.admit_threshold) return 0;
+    /* The repeat-offence rule exists so a one-shot read cannot displace a
+     * resident expert. While the arena still has unused capacity nothing can be
+     * displaced, so waiting for a second fetch only leaves the free half of the
+     * budget empty: admit on the first fetch and let the arena converge on the
+     * session's working set. Once full, admission goes back to choosing victims
+     * by use count, which is what makes the threshold meaningful. */
+    const bool have_room = g_host_arena.slot_count < g_host_arena.max_slots;
+    if (*score < g_host_arena.admit_threshold && !have_room) return 0;
     const uint32_t slot = cuda_host_arena_take_slot();
     if (slot == UINT32_MAX) return 0;
     /* Never claim a live slot. take_slot() only ever returns a free or
@@ -29353,10 +29374,15 @@ static int cuda_stream_selected_cache_begin_load(
                         (uint32_t)(table->gate_expert_bytes * 2u +
                                    table->down_expert_bytes));
             } else {
-                /* This expert is read from host storage into the page cache;
-                 * count it as resident in RAM for the profiler. */
+                /* Not in a GPU pool: the bytes come either from the pinned host
+                 * arena or from the model file. Labeling every one of these as
+                 * arena made the dumps claim an 8192-expert arena sweep while
+                 * the same record reported tens of GiB of SSD reads, so ask the
+                 * arena which it is. */
                 cuda_host_expert_mark(table->layer, (uint32_t)expert,
                                       table->n_total_expert);
+                const int in_arena =
+                    cuda_host_arena_resident(table->layer, (uint32_t)expert);
                 ds4_profiler_trace_event(
                         DS4_PEV_XFER_EXPERT_START, (uint16_t)table->layer,
                         (uint16_t)expert, prof_dst,
@@ -29364,7 +29390,8 @@ static int cuda_stream_selected_cache_begin_load(
                                    table->down_expert_bytes));
                 ds4_profiler_trace_expert(
                         (uint16_t)table->layer, (uint16_t)expert,
-                        DS4_PTRACE_SRC_ARENA, 0xFF, prof_dst,
+                        in_arena ? DS4_PTRACE_SRC_ARENA : DS4_PTRACE_SRC_SSD,
+                        0xFF, prof_dst,
                         (uint32_t)(table->gate_expert_bytes * 2u +
                                    table->down_expert_bytes));
                 cuda_prof_add_pending((uint16_t)table->layer, (uint16_t)expert,

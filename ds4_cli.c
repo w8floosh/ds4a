@@ -675,7 +675,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_display_progress(session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
-    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, prompt->len);
+    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, prompt->len, 1);
 
     int max_tokens = cfg->gen.n_predict;
     int room = ds4_session_ctx(session) - ds4_session_pos(session);
@@ -1699,7 +1699,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     ds4_session_set_progress(chat->session, NULL, NULL);
     ds4_session_set_display_progress(chat->session, NULL, NULL);
     const double t_prefill1 = cli_now_sec();
-    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, (uint64_t)suffix);
+    ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0, (uint64_t)suffix, 1);
 
     token_printer printer = {
         .engine = engine,

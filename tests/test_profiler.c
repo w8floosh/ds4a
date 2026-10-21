@@ -50,7 +50,7 @@ int main(void) {
     ds4_profiler_set_host_stats(&hs);
 
     ds4_profiler_reset_timing();
-    ds4_profiler_note_prefill(100.0, 41);
+    ds4_profiler_note_prefill(100.0, 41, 1);
 
     static char buf[64 * 1024];
     const size_t n = ds4_profiler_json(buf, sizeof(buf));
@@ -125,7 +125,7 @@ int main(void) {
     ds4_profiler_set_record_enabled(0);
     ds4_profiler_set_stage_capture(0);
 
-    ds4_profiler_note_prefill(100.0, 41);
+    ds4_profiler_note_prefill(100.0, 41, 1);
     ds4_profiler_timing t;
     ds4_profiler_timing_snapshot(&t);
     check(t.prefill_ms.n == 1 && t.prefill_ms.last == 100.0, "prefill accum");

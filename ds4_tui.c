@@ -1137,8 +1137,18 @@ static void build_overview(ds4_tui *t) {
             tm->tokens ? dbytes / tm->tokens : 0);
         ds4_profiler_format_bytes(bpt, sizeof(bpt),
             tm->prefill_tokens ? pbytes / tm->prefill_tokens : 0);
-        doc_line(d, ST_NORMAL, "  decode   wall %.2f ms/token  named %.2f ms (%4.1f%%)  residual %.2f ms",
-                 wall, dper, wall > 0 ? 100.0 * dper / wall : 0, wall - dper);
+        /* Named work is per-device wall clock and decode overlaps the two GPUs,
+         * so it can exceed the token wall; a negative residual would read as a
+         * bug, so say what it is instead. */
+        if (dper <= wall)
+            doc_line(d, ST_NORMAL,
+                     "  decode   wall %.2f ms/token  named %.2f ms (%4.1f%%)  residual %.2f ms",
+                     wall, dper, wall > 0 ? 100.0 * dper / wall : 0,
+                     wall - dper);
+        else
+            doc_line(d, ST_NORMAL,
+                     "  decode   wall %.2f ms/token  named %.2f ms (%4.1f%%, stages overlap)",
+                     wall, dper, wall > 0 ? 100.0 * dper / wall : 0);
         doc_line(d, ST_NORMAL, "           %s/token moved, %llu tokens counted",
                  bdt, (unsigned long long)tm->tokens);
         if (tm->prefill_tokens)

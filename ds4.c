@@ -43706,9 +43706,11 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     return false;
 }
 
-char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
-    if (token < 0 || token >= vocab->n_vocab) {
+/* Vocabulary-level piece text: the byte-level detokenisation both the engine
+ * API and the profiler need, so a decode record can name its token without
+ * holding an engine handle. */
+static char *vocab_token_text(const ds4_vocab *vocab, int token, size_t *len) {
+    if (!vocab || token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = xmalloc(1);
         out[0] = '\0';
@@ -43734,6 +43736,10 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     out[n] = '\0';
     if (len) *len = n;
     return out;
+}
+
+char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
+    return vocab_token_text(&e->vocab, token, len);
 }
 
 static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
@@ -57192,6 +57198,22 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
+/* Profiler record for one decode step: the token about to be evaluated names
+ * the record, so a record dump reads as one row per generated token carrying
+ * the text it produced. Not every generation path runs through a session, so
+ * this takes the vocabulary instead of an engine handle. No-op when records are
+ * off. */
+static void profiler_begin_decode_record(const ds4_vocab *vocab, int token,
+                                         int pos) {
+    if (!ds4_profiler_token_begin_ex(DS4_PREC_DECODE_TOKEN, token, pos, 1)) {
+        return;
+    }
+    size_t len = 0;
+    char *text = vocab_token_text(vocab, token, &len);
+    if (text) ds4_profiler_record_text(text, len);
+    free(text);
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -57401,12 +57423,14 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        profiler_begin_decode_record(vocab, token, pos);
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
                                             (uint32_t)token,
                                             (uint32_t)pos,
                                             logits);
+        ds4_profiler_token_end(1);
         if (!ok) break;
         if (token_timing) {
             const double t_eval1 = now_sec();
@@ -57418,7 +57442,12 @@ static int generate_metal_graph_raw_swa(
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
 
+    /* Prefill here is a local loop rather than a session, so nothing else would
+     * tell the profiler its throughput. */
     const double prefill_s = t_prefill1 - t_prefill0;
+    ds4_profiler_note_prefill(prefill_s * 1000.0, (uint64_t)prompt->len,
+                              (uint32_t)((prompt->len + prefill_cap - 1) /
+                                         prefill_cap));
     const double decode_s = t_decode1 - t_decode0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
@@ -62735,6 +62764,7 @@ int ds4_engine_generate_argmax(
                 if (emit) emit(emit_ud, token);
                 n_generated++;
                 if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
+                profiler_begin_decode_record(vocab, token, ds4_session_pos(s));
                 if (greedy_top1) {
                     token = ds4_session_eval_argmax(s, token, err, sizeof(err));
                 } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
@@ -62742,6 +62772,7 @@ int ds4_engine_generate_argmax(
                 } else {
                     token = -1;
                 }
+                ds4_profiler_token_end(1);
                 if (token < 0) {
                     fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
                     rc = 1;
@@ -62750,6 +62781,8 @@ int ds4_engine_generate_argmax(
             }
             const double t_decode1 = now_sec();
             if (done) done(emit_ud);
+            ds4_profiler_note_prefill((t_prefill1 - t_prefill0) * 1000.0,
+                                      (uint64_t)prompt->len, 1);
             ds4_log(stderr,
                     DS4_LOG_TIMING,
                     "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",

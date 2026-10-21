@@ -586,8 +586,11 @@ typedef struct {
 
 int ds4_profiler_token_rec_snapshot(ds4_prof_token_rec *out, int max);
 
-/* Prefill is measured per sync call, not per token. */
-void ds4_profiler_note_prefill(double ms, uint64_t tokens);
+/* Prefill is measured per sync call, not per token.  `chunks` is how many
+ * prefill chunks the measurement covers: callers timing a single chunk pass 1,
+ * callers timing a whole prompt pass the chunk count so per-chunk averages and
+ * the stage tables stay honest. */
+void ds4_profiler_note_prefill(double ms, uint64_t tokens, uint32_t chunks);
 
 /* Drop all accumulated timing (e.g. between REPL turns). */
 void ds4_profiler_reset_timing(void);

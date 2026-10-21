@@ -1230,10 +1230,14 @@ static void timing_note_token(uint64_t tokens) {
     UNLOCK();
 }
 
-void ds4_profiler_note_prefill(double ms, uint64_t tokens) {
+void ds4_profiler_note_prefill(double ms, uint64_t tokens, uint32_t chunks) {
     if (tokens == 0) return;
     LOCK();
     stat_add(&g_timing.prefill_ms, ms);
+    /* prefill_ms.n doubles as the chunk counter: per-chunk averages divide the
+     * wall clock by it, so a whole-prompt measurement must cover every chunk it
+     * timed rather than count as one. */
+    if (chunks > 1u) g_timing.prefill_ms.n += chunks - 1u;
     stat_add(&g_timing.prefill_tokens_per_s,
              ms > 0.0 ? (double)tokens * 1000.0 / ms : 0.0);
     g_timing.prefill_tokens += tokens;
@@ -2016,25 +2020,44 @@ size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen) {
     const double expl = rec_explained_ms(&r, &unexplained);
     const double units = r.n_tokens ? (double)r.n_tokens : 1.0;
 
-    jfmt(&o, "record %llu  %s  %.3f ms  %.3f ms/unit  %u unit%s  pos %d  token %u\n",
-         (unsigned long long)r.seq, ds4_profiler_record_kind_name(r.kind),
-         r.ms, r.ms / units, r.n_tokens, r.n_tokens == 1 ? "" : "s", r.pos,
-         r.token);
-    jraw(&o, "  text ");
-    dump_qtext(&o, r.text);
-    jraw(&o, "\n");
-    jfmt(&o, "  explained %.3f ms (%.1f%%) by %u stages; unmeasured %.3f ms\n",
-         expl, r.ms > 0.0 ? 100.0 * expl / r.ms : 0.0, r.stage_n, unexplained);
+    /* A chunk record has no token of its own and no piece text; naming one would
+     * print the sentinel and an empty string. */
+    if (r.kind == DS4_PREC_PREFILL_CHUNK) {
+        jfmt(&o, "record %llu  %s  %.3f ms  %.3f ms/unit  %u units  pos %d\n",
+             (unsigned long long)r.seq, ds4_profiler_record_kind_name(r.kind),
+             r.ms, r.ms / units, r.n_tokens, r.pos);
+    } else {
+        jfmt(&o, "record %llu  %s  %.3f ms  %.3f ms/unit  %u unit%s  pos %d  token %u\n",
+             (unsigned long long)r.seq, ds4_profiler_record_kind_name(r.kind),
+             r.ms, r.ms / units, r.n_tokens, r.n_tokens == 1 ? "" : "s", r.pos,
+             r.token);
+        jraw(&o, "  text ");
+        dump_qtext(&o, r.text);
+        jraw(&o, "\n");
+    }
+    /* Stage totals are per-device wall clock, and decode splits work across the
+     * GPUs, so overlapping stages can sum past the record: report the ratio
+     * plainly instead of pretending the excess is unexplained time. */
+    const double expl_pct = r.ms > 0.0 ? 100.0 * expl / r.ms : 0.0;
+    jfmt(&o, "  stage time %.3f ms over a %.3f ms record (%.1f%%), %.3f ms unattributed\n",
+         expl, r.ms, expl_pct, unexplained);
+    if (expl_pct > 100.5 && r.stage_n > 0) {
+        jraw(&o, "  (over 100% because stages on different devices overlap)\n");
+    }
     {
         uint64_t p, a, s, c;
         dump_expert_counts(xs, n_x, &p, &a, &s, &c);
-        jfmt(&o, "  experts %d: gpu-pool %llu, host-arena %llu, ssd %llu, cpu %llu\n",
-             n_x, (unsigned long long)p, (unsigned long long)a,
+        /* The per-record buffers are capped, so say when the counts describe a
+         * prefix: a prefill chunk routes far more experts than fit. */
+        jfmt(&o, "  experts %d%s%u: gpu-pool %llu, host-arena %llu, ssd %llu, cpu %llu\n",
+             n_x, n_x < (int)r.expert_n ? " of " : "", r.expert_n,
+             (unsigned long long)p, (unsigned long long)a,
              (unsigned long long)s, (unsigned long long)c);
     }
     ds4_profiler_format_bytes(b1, sizeof(b1), r.ssd_read_bytes);
     ds4_profiler_format_bytes(b2, sizeof(b2), r.host_ram_used);
-    jfmt(&o, "  ssd read %s  host ram %s  events %u\n", b1, b2, n_ev);
+    jfmt(&o, "  ssd read %s  host ram %s  events %u%s%u\n", b1, b2, n_ev,
+         n_ev < (int)r.event_n ? " of " : "", r.event_n);
     jfmt(&o, "  cpu %.1f%% of a core over the record (process), %.1f%% machine busy\n",
          r.end_ns > r.start_ns
              ? 100.0 * (double)r.proc_cpu_ns / (double)(r.end_ns - r.start_ns) : 0.0,
@@ -2071,22 +2094,31 @@ size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen) {
     /* Expert uses: grouped per layer so the routing of the record is readable
      * at a glance, and in selection order inside a layer. */
     if (n_x > 0) {
+        /* One decode token routes ~6 experts per layer, a prefill chunk routes
+         * hundreds; listing all of the latter would bury the routing shape, so
+         * a run is shown up to the cap and its remainder is counted. */
+        const int per_layer_cap = 12;
         jraw(&o, "  expert uses (layer: expert/source/src_gpu->dest_gpu):\n");
         int line = 0;
-        uint16_t layer = 0xffff;
-        for (int i = 0; i < n_x; i++) {
-            const ds4_prof_expert_trace *x = &xs[i];
-            if (x->layer != layer) {
-                layer = x->layer;
-                jfmt(&o, "%s    L%-3u:", line ? "\n" : "", layer);
-                line++;
+        for (int i = 0; i < n_x; ) {
+            const uint16_t layer = xs[i].layer;
+            int end = i;
+            while (end < n_x && xs[end].layer == layer) end++;
+            const int run = end - i;
+            const int shown = run > per_layer_cap ? per_layer_cap : run;
+            jfmt(&o, "%s    L%-3u:", line ? "\n" : "", layer);
+            line++;
+            for (int k = 0; k < shown; k++) {
+                const ds4_prof_expert_trace *x = &xs[i + k];
+                char sg[8], dg[8];
+                if (x->src_gpu == 0xff) snprintf(sg, sizeof(sg), "host");
+                else snprintf(sg, sizeof(sg), "g%u", x->src_gpu);
+                if (x->dest_gpu == 0xff) snprintf(dg, sizeof(dg), "-");
+                else snprintf(dg, sizeof(dg), "g%u", x->dest_gpu);
+                jfmt(&o, " %u/%s/%s>%s", x->expert, dump_src_name(x->source), sg, dg);
             }
-            char sg[8], dg[8];
-            if (x->src_gpu == 0xff) snprintf(sg, sizeof(sg), "host");
-            else snprintf(sg, sizeof(sg), "g%u", x->src_gpu);
-            if (x->dest_gpu == 0xff) snprintf(dg, sizeof(dg), "-");
-            else snprintf(dg, sizeof(dg), "g%u", x->dest_gpu);
-            jfmt(&o, " %u/%s/%s>%s", x->expert, dump_src_name(x->source), sg, dg);
+            if (run > shown) jfmt(&o, " +%d more", run - shown);
+            i = end;
         }
         jraw(&o, "\n");
     }
@@ -2187,9 +2219,9 @@ size_t ds4_profiler_record_dump_json(uint64_t seq, char *buf, size_t buflen) {
 
     uint64_t p, a, s, c;
     dump_expert_counts(xs, n_x, &p, &a, &s, &c);
-    jfmt(&j, "\"experts\":{\"count\":%d,\"gpu_pool\":%llu,\"host_arena\":%llu,"
-             "\"ssd\":%llu,\"cpu\":%llu,\"uses\":[",
-         n_x, (unsigned long long)p, (unsigned long long)a,
+    jfmt(&j, "\"experts\":{\"count\":%d,\"total\":%u,\"gpu_pool\":%llu,"
+             "\"host_arena\":%llu,\"ssd\":%llu,\"cpu\":%llu,\"uses\":[",
+         n_x, r.expert_n, (unsigned long long)p, (unsigned long long)a,
          (unsigned long long)s, (unsigned long long)c);
     for (int i = 0; i < n_x; i++) {
         const ds4_prof_expert_trace *x = &xs[i];
@@ -2206,7 +2238,7 @@ size_t ds4_profiler_record_dump_json(uint64_t seq, char *buf, size_t buflen) {
     }
     jraw(&j, "]},");
 
-    jfmt(&j, "\"events\":{\"count\":%d,\"items\":[", n_ev);
+    jfmt(&j, "\"events\":{\"count\":%d,\"total\":%u,\"items\":[", n_ev, r.event_n);
     for (int i = 0; i < n_ev; i++) {
         const ds4_prof_event *e = &ev[i];
         if (i) jraw(&j, ",");
