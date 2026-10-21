@@ -1106,6 +1106,90 @@ static int cost_cat(const char *category) {
     return COST_CATS - 1;
 }
 
+/* One row of the cost table: a stage with the time it took in the window being
+ * described, already reduced to the window (a token, a chunk, or every counted
+ * token). Rows are ordered by category index, which is what lets one renderer
+ * print the section titles. */
+typedef struct {
+    int         cat;
+    const char *label;
+    double      total_ms, encode_ms, wait_ms;
+    double      calls;
+    uint64_t    bytes;
+} cost_row;
+
+/* The cost table, shared by the overview's aggregate and by a single record on
+ * the detail page: same columns, same categories, same share column pinned to
+ * the right edge, same total row, so a token reads like the average it is being
+ * compared with. `units` is how many tokens the rows cover; every number is
+ * printed per unit, which is why the share column and the total agree. */
+static void cost_table(tui_block *b, const char *legend, const cost_row *rows,
+                       int n_rows, double sum_ms, double units) {
+    tui_doc *bd = &b->doc;
+    const int wide = b->w >= 88;
+    const int mid = b->w >= 74;
+    /* A narrow column keeps the three numbers and drops the rest; the label
+     * takes whatever is left so a row never wraps into the next one. */
+    const int lw = b->w - 26 >= 18 ? 18 : (b->w - 26 >= 10 ? b->w - 26 : 10);
+    doc_line(bd, ST_CYAN, " %s  (%.3f ms each, n=%.0f)", legend,
+             units > 0 ? sum_ms / units : 0, units);
+    if (wide)
+        doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
+                  "  stage                          total   launch"
+                  "     wait  calls/tok   bytes/tok");
+    else if (mid)
+        doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
+                  "  stage                          total   launch"
+                  "     wait  calls/tok");
+    else
+        doc_line(bd, ST_GRAY, "  %-*.*s %5.5s %5.5s %5.5s",
+                 lw, lw, "stage", "total", "laun", "wait");
+    int shown = 0, last_cat = -1;
+    for (int i = 0; i < n_rows; i++) {
+        const cost_row *r = &rows[i];
+        if (r->total_ms <= 0) continue;
+        if (r->cat != last_cat) {
+            last_cat = r->cat;
+            doc_line(bd, ST_CYAN, "  %s", k_cost_cats[r->cat].title);
+        }
+        const double total = units > 0 ? r->total_ms / units : 0;
+        const double enc = units > 0 ? r->encode_ms / units : 0;
+        const double wait = units > 0 ? r->wait_ms / units : 0;
+        const double calls = units > 0 ? r->calls / units : 0;
+        char shr[24];
+        snprintf(shr, sizeof(shr), "  %5.1f%%",
+                 sum_ms > 0 ? 100.0 * r->total_ms / sum_ms : 0);
+        if (wide) {
+            char bs[24];
+            ds4_profiler_format_bytes(bs, sizeof(bs),
+                units >= 1 ? (uint64_t)((double)r->bytes / units) : 0);
+            doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
+                      "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f  %10s",
+                      r->label, total, enc, wait, calls, bs);
+        } else if (mid) {
+            doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
+                      "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f",
+                      r->label, total, enc, wait, calls);
+        } else {
+            doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
+                      "  %-*.*s %5.2f %5.2f %5.2f",
+                      lw, lw, r->label, total, enc, wait);
+        }
+        shown++;
+    }
+    {
+        const double tot = units > 0 ? sum_ms / units : 0;
+        if (wide || mid)
+            doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
+                      "  %-28.28s %7.3f", "total", tot);
+        else
+            doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
+                      "  %-*.*s %5.2f", lw, lw, "total", tot);
+    }
+    if (!shown)
+        doc_line(bd, ST_YELLOW, "  no stage rows captured");
+}
+
 /* 8-level sparkline. Zero values render as a baseline dot. */
 static void spark(sbuf *b, const double *v, int n, double max, const char *color) {
     static const char *blocks[] = {" ", ".", ":", "-", "=", "+", "*", "#"};
@@ -1494,6 +1578,7 @@ static void build_overview(ds4_tui *t) {
      * measured stage time, not the wall time of the token. */
     doc_line(d, ST_TITLE, " Cost per token by stage");
     {
+        static cost_row rows[DS4_PROF_MAX_STAGES];
         double sums[2] = {0, 0};
         for (int pass = 0; pass < 2; pass++) {
             const int kind = pass == 0 ? DS4_PREC_DECODE_TOKEN : DS4_PREC_PREFILL_CHUNK;
@@ -1507,80 +1592,26 @@ static void build_overview(ds4_tui *t) {
             const int kind = pass == 0 ? DS4_PREC_DECODE_TOKEN : DS4_PREC_PREFILL_CHUNK;
             const double units = pass == 0 ? (double)tm->tokens
                                            : (double)tm->prefill_tokens;
-            const double ksum = sums[pass];
-            tui_block *b = block_alloc(t, pass_n, 74, nblk++);
-            tui_doc *bd = &b->doc;
-            const int wide = b->w >= 88;
-            const int mid = b->w >= 74;
-            /* A narrow column keeps the three numbers and drops the rest; the
-             * label takes whatever is left so a row never wraps into the next
-             * one: 2 + label + 3 * (1 + 5) + 1 + 6 == the block width. */
-            const int lw = b->w - 26 >= 18 ? 18 : (b->w - 26 >= 10 ? b->w - 26 : 10);
-            doc_line(bd, ST_CYAN, " %s  (%.3f ms each, n=%.0f)",
-                     pass == 0 ? "decode token" : "prefill chunk",
-                     units > 0 ? ksum / units : 0, units);
-            if (wide)
-                doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
-                          "  stage                          total   launch"
-                          "     wait  calls/tok   bytes/tok");
-            else if (mid)
-                doc_share(bd, ST_GRAY | ST_NOWRAP, b->w, "   share",
-                          "  stage                          total   launch"
-                          "     wait  calls/tok");
-            else
-                doc_line(bd, ST_GRAY, "  %-*.*s %5.5s %5.5s %5.5s",
-                         lw, lw, "stage", "total", "laun", "wait");
-            int shown = 0;
-            for (int ci = 0; ci < COST_CATS; ci++) {
-                int any = 0;
-                for (int i = 0; i < v->n_stages; i++)
-                    if (cost_cat(v->stages[i].category) == ci &&
-                        v->stages[i].kind[kind].total_ms > 0)
-                        any = 1;
-                if (!any) continue;
-                doc_line(bd, ST_CYAN, "  %s", k_cost_cats[ci].title);
-                for (int i = 0; i < v->n_stages; i++) {
+            int n = 0;
+            /* Rows in category order: the renderer prints a section title when
+             * the category changes, so the order is part of the struct. */
+            for (int ci = 0; ci < COST_CATS; ci++)
+                for (int i = 0; i < v->n_stages && n < DS4_PROF_MAX_STAGES; i++) {
                     const ds4_prof_stage_view *s = &v->stages[i];
                     const ds4_prof_stage_kind *k = &s->kind[kind];
                     if (cost_cat(s->category) != ci || k->total_ms <= 0) continue;
-                    const double total = units > 0 ? k->total_ms / units : 0;
-                    const double enc = units > 0 ? k->encode_ms / units : 0;
-                    const double wait = units > 0 ? k->wait_ms / units : 0;
-                    const double calls = units > 0 ? (double)k->calls / units : 0;
-                    char shr[24];
-                    snprintf(shr, sizeof(shr), "  %5.1f%%",
-                             ksum > 0 ? 100.0 * k->total_ms / ksum : 0);
-                    if (wide) {
-                        char bs[24];
-                        ds4_profiler_format_bytes(bs, sizeof(bs),
-                            units >= 1 ? k->bytes / (uint64_t)units : 0);
-                        doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
-                                  "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f  %10s",
-                                  s->label, total, enc, wait, calls, bs);
-                    } else if (mid) {
-                        doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
-                                  "  %-28.28s %7.3f  %7.3f  %7.3f  %8.2f",
-                                  s->label, total, enc, wait, calls);
-                    } else {
-                        doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, shr,
-                                  "  %-*.*s %5.2f %5.2f %5.2f",
-                                  lw, lw, s->label, total, enc, wait);
-                    }
-                    shown++;
+                    cost_row *r = &rows[n++];
+                    r->cat = ci;
+                    r->label = s->label;
+                    r->total_ms = k->total_ms;
+                    r->encode_ms = k->encode_ms;
+                    r->wait_ms = k->wait_ms;
+                    r->calls = (double)k->calls;
+                    r->bytes = k->bytes;
                 }
-            }
-            {
-                const double tot = units > 0 ? ksum / units : 0;
-                if (wide || mid)
-                    doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
-                              "  %-28.28s %7.3f", "total", tot);
-                else
-                    doc_share(bd, ST_NORMAL | ST_NOWRAP, b->w, "  100.0%",
-                              "  %-*.*s %5.2f", lw, lw, "total", tot);
-            }
-            if (!shown)
-                doc_line(bd, ST_YELLOW, "  no stage rows captured (capture is %s)",
-                         t->granular ? "on" : "off");
+            tui_block *b = block_alloc(t, pass_n, 74, nblk++);
+            cost_table(b, pass == 0 ? "decode token" : "prefill chunk",
+                       rows, n, sums[pass], units);
         }
         if (pass_n == 0)
             doc_line(d, ST_YELLOW, "  no stage rows captured (capture is %s)",
@@ -1825,51 +1856,69 @@ static void build_detail(ds4_tui *t) {
                  bssd, bram);
     }
 
-    doc_line(d, ST_TITLE, " Cost components (one row per operation)");
-    const int dwide = t->prof_cols >= 88;
-    if (dwide)
-        doc_line(d, ST_GRAY, "  operation                     total    launch     wait    calls      bytes     rate");
-    else
-        doc_line(d, ST_GRAY, "  %-16.16s %6.6s %6.6s %6.6s %5.5s %8.8s", "operation",
-                 "total", "launch", "wait", "calls", "bytes");
+    /* Totals for this record, in the same shape as the overview's averages:
+     * the same four quantities, in the same words, so one token can be read
+     * against the run it belongs to instead of in a format of its own. */
+    double sum_ms = 0, moved = 0;
     for (uint32_t i = 0; i < r.stage_n; i++) {
-        char key[64] = {0};
-        const int id = r.stages[i].id;
-        const char *label = key;
-        if (t->view && id < t->view->n_stages) {
-            snprintf(key, sizeof(key), "%s", t->view->stages[id].key);
-            label = t->view->stages[id].label;
-        }
-        const ds4_prof_stage_use *u = &r.stages[i];
-        char by[24], br[24];
-        ds4_profiler_format_bytes(by, sizeof(by), u->bytes);
-        ds4_profiler_format_bytes(br, sizeof(br), u->total_ns
-            ? (uint64_t)((double)u->bytes / ((double)u->total_ns / 1e9)) : 0);
-        if (dwide)
-            doc_line_wide(d, ST_NORMAL, "  %-26.26s %8.3f  %8.3f  %8.3f  %6llu %10s %10s/s",
-                          label, (double)u->total_ns / 1e6,
-                          (double)u->encode_ns / 1e6, (double)u->wait_ns / 1e6,
-                          (unsigned long long)u->count, by, br);
-        else
-            doc_line_wide(d, ST_NORMAL, "  %-16.16s %6.2f %6.2f %6.2f %5llu %8s",
-                          label, (double)u->total_ns / 1e6,
-                          (double)u->encode_ns / 1e6, (double)u->wait_ns / 1e6,
-                          (unsigned long long)u->count, by);
+        sum_ms += (double)r.stages[i].total_ns / 1e6;
+        moved += (double)r.stages[i].bytes;
     }
-    if (r.stage_n == 0)
-        doc_line(d, ST_YELLOW, "  no stages recorded (stage capture was off)");
+    const double units = r.n_tokens ? (double)r.n_tokens : 1.0;
+    const double wall = r.ms / units;
+    const int dwide = t->prof_cols >= 88;
+    doc_line(d, ST_TITLE, " This record");
     {
-        uint64_t sum = 0;
-        for (uint32_t i = 0; i < r.stage_n; i++) sum += r.stages[i].total_ns;
-        const double wall = r.ms;
-        const double stages = (double)sum / 1e6;
-        if (wall >= stages)
-            doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; stage sum %.3f ms; unmeasured %.3f ms",
-                     wall, stages, wall - stages);
+        char bm[24];
+        ds4_profiler_format_bytes(bm, sizeof(bm), (uint64_t)(moved / units));
+        tui_block *b = block_alloc(t, 1, 52, 0);
+        const double stages = sum_ms / units;
+        doc_line(&b->doc, ST_CYAN, " %s", ds4_profiler_record_kind_name(r.kind));
+        doc_line(&b->doc, ST_NORMAL, "   wall %.2f ms/token", wall);
+        /* Same two numbers as the overview's averages; the share only makes
+         * sense against a wall that was measured, and a record can be opened
+         * from a burst that lasted under a millisecond. */
+        if (wall > 0.01)
+            doc_line(&b->doc, ST_NORMAL, "   stage sum %.2f ms (%.0f%% of wall)",
+                     stages, 100.0 * stages / wall);
         else
-            doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; stage sum %.3f ms (rows overlap)", wall, stages);
+            doc_line(&b->doc, ST_NORMAL, "   stage sum %.2f ms (no wall measured)",
+                     stages);
+        doc_line(&b->doc, ST_GRAY, "   %s/token moved", bm);
+        doc_line(&b->doc, ST_GRAY, "   %llu tokens counted",
+                 (unsigned long long)r.n_tokens);
+        doc_blocks(t, d, 1, 52);
+    }
+
+    /* The same table as the overview, filled from this record: one token's
+     * stages against the same categories, with the share of this record. */
+    doc_line(d, ST_TITLE, " Cost per token by stage");
+    {
+        static cost_row rows[DS4_PROF_REC_MAX_STAGES];
+        int n = 0;
+        for (int ci = 0; ci < COST_CATS; ci++)
+            for (uint32_t i = 0; i < r.stage_n && n < DS4_PROF_REC_MAX_STAGES; i++) {
+                const ds4_prof_stage_use *u = &r.stages[i];
+                const char *label = "stage";
+                const char *category = "";
+                if (t->view && u->id < (uint16_t)t->view->n_stages) {
+                    label = t->view->stages[u->id].label;
+                    category = t->view->stages[u->id].category;
+                }
+                if (cost_cat(category) != ci) continue;
+                cost_row *row = &rows[n++];
+                row->cat = ci;
+                row->label = label;
+                row->total_ms = (double)u->total_ns / 1e6;
+                row->encode_ms = (double)u->encode_ns / 1e6;
+                row->wait_ms = (double)u->wait_ns / 1e6;
+                row->calls = (double)u->count;
+                row->bytes = u->bytes;
+            }
+        tui_block *b = block_alloc(t, 1, 74, 0);
+        cost_table(b, ds4_profiler_record_kind_name(r.kind), rows, n,
+                   sum_ms, units);
+        doc_blocks(t, d, 1, 74);
     }
 
     /* Device state and link traffic are two short tables about the same record,
@@ -2133,12 +2182,16 @@ static void build_help(ds4_tui *t) {
         break;
     case PV_DETAIL:
         para_put(d, ST_GRAY,
-                 "total = CPU launch time + device wait, so a stage never hides "
-                 "what its own launch cost. Stage times are per-device wall "
-                 "clock: one record runs on two GPUs at once, so their sum can "
-                 "exceed the record wall. The residual is sampling, detokenising "
-                 "and the gaps between stages. Expert uses show where a weight "
-                 "lived (source) and the device that ran it (from -> to).");
+                 "The same structure as the overview, filled from one record: "
+                 "wall, stage sum and share, then the cost table with the same "
+                 "categories and columns, every number per token, and each row's "
+                 "share of this record. Total = CPU launch time + device wait, "
+                 "so a stage never hides what its own launch cost. Stage times "
+                 "are per-device wall clock and one record runs on two GPUs at "
+                 "once, so their sum can exceed the record wall; the residual is "
+                 "sampling, detokenising and the gaps between stages. Expert uses "
+                 "show where a weight lived (source) and the device that ran it "
+                 "(from -> to).");
         break;
     case PV_DEVICES:
         para_put(d, ST_GRAY,
