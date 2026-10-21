@@ -1609,6 +1609,12 @@ static void build_overview(ds4_tui *t) {
                      (unsigned long long)st->host_arena_hits,
                      (unsigned long long)st->host_arena_misses,
                      (unsigned long long)st->host_arena_admissions);
+            /* Zero admissions next to free slots reads as a stuck arena, so
+             * name the one case where it is intended: a preload that filled
+             * the pin leaves no room to admit into. */
+            if (!st->host_arena_admission)
+                doc_line(&br->doc, ST_GRAY,
+                         "  admission off: the preload filled the pin");
         }
         doc_line(&bd->doc, ST_TITLE, " Devices and storage (live)");
         for (int i = 0; i < v->dev_n; i++) {
@@ -2133,8 +2139,9 @@ static void build_help(ds4_tui *t) {
                  "ran. Arena hits were served from RAM, admissions are misses "
                  "that took an empty slot, evictions reclaim a slot when full. "
                  "The pin is reserved once at start-up and filled from the preload "
-                 "and from live misses, so a partly filled arena over free slots is "
-                 "a session that left them unused, not a fill that stopped.");
+                 "and from live misses until it is full; admission off means the "
+                 "preload already filled it, so free slots only remain when nothing "
+                 "missed both VRAM and the arena.");
         break;
     default:
         para_put(d, ST_GRAY,

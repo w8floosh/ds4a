@@ -148,11 +148,16 @@ resident. Filling from the session's own routing beats an offline hotlist: on a
 want.
 
 "Reserved" and "filled" are different numbers and both are reported. The free
-rest is not a fill that stalled: an expert only reaches the arena if it is
-missing everywhere else, so on a session the preload and the pool already cover,
-the free slots stay free and the pin simply has headroom for the misses that
-never came. Size `--expert-arena` for the worst case, not for what a short run
-touches.
+rest is not a fill that stalled: the pin fills until full, and an expert only
+reaches the arena if it is missing everywhere else, so free slots mean either
+the pin is already full or nothing missed both VRAM and the arena yet. Admission
+is switched on from the fill the preload actually reached, not from the bytes it
+asked for: the hotlist is finite (a few thousand experts), so requesting a
+preload as large as the arena still comes up short, and the rest is finished by
+the session's own routing. `--profile-dump` reports that state as
+`admission on|off`, right next to the admission count, so a pin that is not
+growing can be told apart from an admission that is off. Size `--expert-arena`
+for the worst case, not for what a short run touches.
 
 Residency and split fetches (`arena_hits` / `arena_misses`) are reported by the
 TUI profiler's residency block and by `--profile-dump`, along with, when runtime

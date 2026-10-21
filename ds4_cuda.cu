@@ -28361,6 +28361,7 @@ typedef struct {
     uint64_t admissions;
     uint64_t evictions;
     uint64_t evicted_fetches;
+    int      admission;
 } ds4_gpu_host_arena_stats_t;
 
 static void cuda_host_arena_free(void) {
@@ -28757,6 +28758,9 @@ extern "C" void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out) {
     out->admissions = g_host_arena.admissions;
     out->evictions = g_host_arena.evictions;
     out->evicted_fetches = g_host_arena.evicted_fetches;
+    /* Whether a miss can still land in the pin: zero admissions with free
+     * slots reads as a stuck arena unless the profile says admission is off. */
+    out->admission = g_host_arena.admit_threshold != UINT32_MAX;
 }
 
 
@@ -36608,6 +36612,7 @@ extern "C" void ds4_gpu_profiler_stats(ds4_profiler_stats *out) {
     out->host_arena_admissions = arena_stats.admissions;
     out->host_arena_evictions = arena_stats.evictions;
     out->host_arena_evicted_fetches = arena_stats.evicted_fetches;
+    out->host_arena_admission = (uint32_t)(arena_stats.admission ? 1 : 0);
     /* Process-wide consumers that live on tier 0, measured once per sample. */
     uint64_t arena_bytes = 0;
     for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;

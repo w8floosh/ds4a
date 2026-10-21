@@ -34011,11 +34011,6 @@ static bool metal_graph_seed_host_expert_arena(
     uint32_t per_layer = slots_fill / DS4_N_LAYER;
     if (per_layer == 0) per_layer = 1;
 
-    /* Whatever the preload does not cover is filled from live reads. Without
-     * this a bounded start-up would leave the arena permanently undersized. */
-    const int admit = fill < budget;
-    ds4_gpu_host_arena_set_admission(admit ? 2u : 0u);
-
     const uint16_t (*hotlist)[2] = NULL;
     const uint32_t hotlist_count = engine_expert_hotlist(&hotlist);
     if (!hotlist || hotlist_count == 0) return true;
@@ -34066,16 +34061,26 @@ static bool metal_graph_seed_host_expert_arena(
     }
     ds4_gpu_host_arena_stats_t arena;
     ds4_gpu_host_arena_stats(&arena);
-    /* Pin size and fill, not intent: the budget floors to whole slots, so the
-     * pinned bytes are usually a little under what was asked for, and printing
-     * what was seeded (not what was planned) is what makes a shortfall visible. */
+    /* Whatever the preload did not cover is filled from live reads. The decision
+     * looks at the pinned fill, not at the preload intent: the hotlist is
+     * finite (a few thousand experts), so asking for a preload as large as the
+     * arena still comes up short, and gating admission on the requested bytes
+     * left the rest of the pin empty while the SSD re-read experts that had
+     * room. A pin the preload did fill stays preload-only: recycling there
+     * would only churn the set the hotlist argued for. */
+    const int admit = arena.used_bytes < arena.capacity_bytes;
+    ds4_gpu_host_arena_set_admission(admit ? 2u : 0u);
+    /* Report the pin and the fill, not the preload intent, and name the
+     * hotlist ceiling: the budget floors to whole slots and the hotlist is
+     * finite, so printing only what was seeded made a short fill look stalled. */
     fprintf(stderr,
             "ds4: host expert arena: pinned %.2f GiB (budget %.2f GiB), "
-            "preloaded %.2f GiB (%u experts in %.3f s), fill from live reads: %s\n",
+            "preloaded %.2f GiB (%u experts, hotlist covers %u, %.3f s), "
+            "fill from live reads: %s\n",
             (double)arena.capacity_bytes / 1073741824.0,
             (double)budget / 1073741824.0,
             (double)arena.used_bytes / 1073741824.0,
-            arena.experts,
+            arena.experts, hotlist_count,
             now_sec() - t0,
             admit ? "on" : "off");
     return true;

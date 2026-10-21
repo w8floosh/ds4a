@@ -1591,6 +1591,7 @@ size_t ds4_profiler_json(char *buf, size_t buflen) {
     jbytes(&j, "arena_hits", s.host_arena_hits);    jraw(&j, ",");
     jbytes(&j, "arena_misses", s.host_arena_misses); jraw(&j, ",");
     jbytes(&j, "arena_admissions", s.host_arena_admissions); jraw(&j, ",");
+    jbytes(&j, "arena_admission", s.host_arena_admission); jraw(&j, ",");
     jbytes(&j, "arena_evictions", s.host_arena_evictions); jraw(&j, ",");
     jbytes(&j, "arena_evicted_fetches", s.host_arena_evicted_fetches); jraw(&j, ",");
     jbytes(&j, "kv_bytes", h.kv_bytes);             jraw(&j, ",");
@@ -2424,26 +2425,32 @@ size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit) {
                  ? 100.0 * (double)v.stats.host_arena_experts /
                        (double)v.host.total_experts : 0.0);
         jfmt(&o, "  arena lookups: %llu hits (%.1f%%), %llu misses; "
-                 "%llu admissions, %llu evictions, %llu fetches of evicted experts\n",
+                 "%llu admissions, %llu evictions, %llu fetches of evicted "
+                 "experts; admission %s\n",
              (unsigned long long)v.stats.host_arena_hits,
              look ? 100.0 * (double)v.stats.host_arena_hits / (double)look : 0.0,
              (unsigned long long)v.stats.host_arena_misses,
              (unsigned long long)v.stats.host_arena_admissions,
              (unsigned long long)v.stats.host_arena_evictions,
-             (unsigned long long)v.stats.host_arena_evicted_fetches);
-        /* Free slots stay free until a fetch misses the pool and the arena at
-         * once, which is rare on a session the preload already covers. Say so
-         * here, or the unused rest of the pin looks like a fill that stopped. */
+             (unsigned long long)v.stats.host_arena_evicted_fetches,
+             v.stats.host_arena_admission ? "on" : "off");
+        /* Free slots are claimed by the very next misses the pool cannot serve,
+         * so a wide gap means the preload could not spend the budget (a finite
+         * hotlist) and is being finished from live reads. Say which, or the
+         * unused rest of the pin reads as a fill that stopped. */
         const uint64_t free_bytes =
             v.stats.host_arena_capacity_bytes > v.stats.host_arena_used_bytes
                 ? v.stats.host_arena_capacity_bytes - v.stats.host_arena_used_bytes
                 : 0;
         ds4_profiler_format_bytes(c2, sizeof(c2), free_bytes);
-        jfmt(&o, "  arena free slots: %llu experts (%s), filled only when a "
-                 "fetch misses both the pool and the arena\n",
+        jfmt(&o, "  arena free slots: %llu experts (%s), %s\n",
              (unsigned long long)(free_bytes /
                  (v.stats.host_expert_bytes ? v.stats.host_expert_bytes : 1)),
-             c2);
+             c2,
+             free_bytes == 0 ? "the pin is full, so an admission now evicts"
+             : v.stats.host_arena_admission
+                 ? "claimed by the next misses the pool cannot serve"
+                 : "admission is off, so they stay free");
     } else {
         jraw(&o, "  expert arena: not configured\n");
     }

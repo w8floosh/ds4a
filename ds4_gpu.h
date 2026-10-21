@@ -469,6 +469,7 @@ typedef struct {
     uint64_t admissions;
     uint64_t evictions;
     uint64_t evicted_fetches;
+    int      admission;    /* live reads may claim slots (first fetch with room) */
 } ds4_gpu_host_arena_stats_t;
 void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out);
 /* CPU expert offload: mark the selected experts the engine computes on the

@@ -18062,7 +18062,10 @@ void ds4_gpu_host_arena_stats(ds4_gpu_host_arena_stats_t *out) {
     out->hits = g_stream_expert_cache_hits;
     out->misses = g_stream_expert_cache_misses;
     /* The resident cache owns its own admission/eviction accounting; it is not
-     * surfaced here, so those counters stay zero on Metal. */
+     * surfaced here, so those counters stay zero on Metal. It does always admit
+     * on a miss, so report admission as on rather than as an empty pin waiting
+     * for a rule that Metal does not need. */
+    out->admission = 1;
 }
 static uint32_t ds4_gpu_q4_expert_table_group_size(uint32_t n_total_expert) {
     const char *env = getenv("DS4_METAL_Q4_EXPERT_TABLE_GROUP_SIZE");

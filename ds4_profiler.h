@@ -77,6 +77,7 @@ typedef struct {
     uint64_t host_arena_hits;
     uint64_t host_arena_misses;
     uint64_t host_arena_admissions;
+    uint32_t host_arena_admission;   /* misses may still claim free slots */
     uint64_t host_arena_evictions;
     uint64_t host_arena_evicted_fetches;
     ds4_profiler_device dev[DS4_PROFILER_MAX_DEV];
