@@ -3,7 +3,6 @@
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_roles.h"
 #include "ds4_profiler.h"
-#include "ds4_dashboard.h"
 #include "ds4_tui.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
@@ -117,9 +116,6 @@ static volatile sig_atomic_t cli_interrupted;
 static volatile sig_atomic_t cli_dist_busy;
 static volatile sig_atomic_t cli_dist_notice_printed;
 
-/* --dashboard-bind / --dashboard-lan: where the telemetry dashboard listens.
- * NULL keeps the loopback default. See ds4_dashboard.h for the warning. */
-static const char *cli_dashboard_bind;
 /* Headless profiler output: a report written when the run ends, with the
  * newest records in full detail. `--profile-dump -` writes to stdout. */
 static const char *cli_profile_dump_path;
@@ -1325,9 +1321,6 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                     ds4_backend_name(cfg->engine.backend));
         }
     } else {
-        /* Single-shot generation exposes the dashboard too, so a scripted run
-         * is observable without the interactive REPL. */
-        ds4_dashboard_start(cli_dashboard_bind, 0, 1);
         if (cfg->engine.distributed.role == DS4_DISTRIBUTED_COORDINATOR ||
             cfg->engine.tp.role == DS4_TP_LEADER ||
             getenv("DS4_CLI_FORCE_SESSION") != NULL ||
@@ -1865,10 +1858,6 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
     }
 
     int rc = 0;
-    /* Start the local dashboard only when there is no full-screen UI or the
-     * operator explicitly asked for a network bind. */
-    if (!g_tui || cli_dashboard_bind)
-        ds4_dashboard_start(cli_dashboard_bind, 0, !g_tui);
     if (g_tui) {
         ds4_tui_log(g_tui, 0,
             "commands: /help /think [N] /think-max /nothink /ctx N /power N /steer F /read FILE /quit");
@@ -2010,7 +1999,6 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         }
         cli_line_free(line);
     }
-    ds4_dashboard_stop();
     if (g_tui) { ds4_tui_destroy(g_tui); g_tui = NULL; }
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
     repl_chat_free(&chat);
@@ -2301,18 +2289,12 @@ static cli_config parse_options(int argc, char **argv) {
             } else {
                 c.engine.ssd_streaming_arena_preload_set = true;
             }
-        } else if (!strcmp(arg, "--dashboard-bind")) {
-            /* Serve the telemetry dashboard on the network instead of
-             * loopback. No authentication: trusted LANs only. */
-            cli_dashboard_bind = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--tui")) {
             c.tui = true;
             c.tui_explicit = true;
         } else if (!strcmp(arg, "--no-tui")) {
             c.tui = false;
             c.tui_explicit = true;
-        } else if (!strcmp(arg, "--dashboard-lan")) {
-            cli_dashboard_bind = "0.0.0.0";
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

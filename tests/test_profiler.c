@@ -1,7 +1,8 @@
-/* tests/test_profiler.c — telemetry JSON contract.
+/* tests/test_profiler.c — telemetry contract.
  *
  * Runs with -DDS4_NO_GPU, so the backend reports zero devices; this covers the
- * engine-owned parts (host stats, timing accumulation, serialization shape). */
+ * engine-owned parts: host stats, timing accumulation, records, stage rows and
+ * the bounded event history. */
 #include "ds4_profiler.h"
 
 #include <stdio.h>
@@ -14,23 +15,6 @@ static void check(int cond, const char *what) {
         printf("FAIL: %s\n", what);
         fails++;
     }
-}
-
-/* Quote-aware brace/bracket balance, so a brace inside a label cannot fool it. */
-static int balanced(const char *s) {
-    int depth = 0, in_str = 0, esc = 0;
-    for (; *s; s++) {
-        if (in_str) {
-            if (esc) esc = 0;
-            else if (*s == '\\') esc = 1;
-            else if (*s == '"') in_str = 0;
-            continue;
-        }
-        if (*s == '"') in_str = 1;
-        else if (*s == '{' || *s == '[') depth++;
-        else if (*s == '}' || *s == ']') depth--;
-    }
-    return depth == 0;
 }
 
 int main(void) {
@@ -51,23 +35,6 @@ int main(void) {
 
     ds4_profiler_reset_timing();
     ds4_profiler_note_prefill(100.0, 41, 1);
-
-    static char buf[64 * 1024];
-    const size_t n = ds4_profiler_json(buf, sizeof(buf));
-    check(n > 0 && n < sizeof(buf), "json size");
-    check(strstr(buf, "\"expert_distribution\"") != NULL, "distribution key");
-    check(strstr(buf, "\"on_gpu\"") != NULL, "on_gpu key");
-    check(strstr(buf, "\"in_host_ram\"") != NULL, "in_host_ram key");
-    check(strstr(buf, "\"bytes_per_expert\":6750000") != NULL, "per-expert bytes");
-    check(strstr(buf, "\"timing\"") != NULL, "timing key");
-    check(strstr(buf, "\"per_token_ms\"") != NULL, "per_token_ms key");
-    check(strstr(buf, "\"weight_transfer_ms\"") != NULL, "weight key");
-    check(strstr(buf, "\"activation_transfer_ms\"") != NULL, "activation key");
-    check(strstr(buf, "\"host_ms\"") != NULL, "host key");
-    check(strstr(buf, "\"device_wait_ms\"") != NULL, "device wait key");
-    check(strstr(buf, "\"prefill_ms\":{\"last\":100.000") != NULL, "prefill last");
-    check(strstr(buf, "\"model_bytes\":85899345920") != NULL, "model bytes");
-    check(balanced(buf), "balanced braces");
 
     /* Detailed records: one token, two measured stages, one expert use. */
     ds4_profiler_reset_timing();
@@ -114,13 +81,6 @@ int main(void) {
     check(view.n_records == 1, "view records");
     check(view.stages[0].total_ms.n == 1, "stage stat sampled");
     check(view.stages[0].total_ms.last == 1.2, "stage ms");
-
-    const size_t n2 = ds4_profiler_json(buf, sizeof(buf));
-    check(n2 > 0 && n2 < sizeof(buf), "json size with records");
-    check(strstr(buf, "\"stage_rows\"") != NULL, "stage rows key");
-    check(strstr(buf, "\"records\"") != NULL, "records key");
-    check(strstr(buf, "\"seq\":") != NULL, "record sequence key");
-    check(balanced(buf), "balanced braces with records");
 
     ds4_profiler_set_record_enabled(0);
     ds4_profiler_set_stage_capture(0);
@@ -170,6 +130,6 @@ int main(void) {
         printf("test_profiler: %d failure(s)\n", fails);
         return 1;
     }
-    printf("test_profiler: ok (%zu bytes json)\n", n);
+    printf("test_profiler: ok\n");
     return 0;
 }

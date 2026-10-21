@@ -1,18 +1,17 @@
 /* ds4_profiler.h — engine telemetry: per-token/chunk records, stage costs,
- * transfer/wait counters, and a JSON snapshot.
+ * transfer/wait counters, expert residency.
  *
- * Two consumers share the same numbers: ds4_tui.c renders the terminal UI
- * directly from ds4_profiler_view()/record_get(), and ds4_dashboard.c serves
- * ds4_profiler_json() over HTTP. This module owns only data and aggregation;
- * it never writes to the terminal.
+ * The consumer is ds4_tui.c, which renders the profiler pane directly from
+ * ds4_profiler_view()/record_get(); the report is also what --profile-dump
+ * writes at the end of a run. This module owns only data and aggregation; it
+ * never writes to the terminal.
  *
  * Producers are split by knowledge:
  *   - the GPU backend fills ds4_profiler_stats (per-device memory, PCIe links);
  *   - the engine fills ds4_profiler_host_stats (model size, host expert cache);
  *   - the decode loop feeds per-token timing through ds4_profiler_note_token().
  *
- * The "no acronyms" rule applies to the dashboard's human labels, not to these
- * field names.
+ * The "no acronyms" rule applies to the human labels, not to these field names.
  */
 #ifndef DS4_PROFILER_H
 #define DS4_PROFILER_H
@@ -27,8 +26,8 @@ extern "C" {
 #define DS4_PROFILER_MAX_DEV  16
 #define DS4_PROFILER_TYPE_LEN 24
 
-/* Per-device snapshot. Byte fields are raw; the dashboard turns them into the
- * human-facing composition. */
+/* Per-device snapshot. Byte fields are raw; the profiler pane turns them into
+ * the human-facing composition. */
 typedef struct {
     int      device_id;
     uint64_t vram_used_bytes;
@@ -213,8 +212,7 @@ void ds4_profiler_token_begin(void);
 void ds4_profiler_token_end(uint64_t tokens);
 
 /* ---- per-step timeline ---------------------------------------------------
- * One row per kind of cost, never two kinds merged. The dashboard's simple
- * view shows the rows that matter; the advanced view shows every row.
+ * One row per kind of cost, never two kinds merged.
  *
  *   HOST   CPU wall time spent doing work (not blocked on the device)
  *   DEV    GPU busy time on one kernel group
@@ -222,8 +220,8 @@ void ds4_profiler_token_end(uint64_t tokens);
  *   WAIT   CPU blocked waiting for the device (kept apart from HOST on purpose:
  *          waiting is not work, and merging them hides the bottleneck)
  *
- * Every row carries a human label and a one-line explanation so the dashboard
- * can show a tooltip without duplicating this table in JavaScript.
+ * Every row carries a human label and a one-line explanation, so a reader (or a
+ * tooltip) never needs a second copy of this table.
  */
 typedef enum {
     DS4_PSTEP_HOST_EMBED,
@@ -581,24 +579,6 @@ void ds4_profiler_note_stage(const char *part, const char *name,
                              uint64_t total_ns, uint64_t encode_ns,
                              uint64_t wait_ns, uint64_t bytes);
 
-/* ---- per-token summary (legacy dashboard shape) ------------------------ */
-enum { DS4_PTREC_RING = 8 };
-
-typedef struct {
-    uint32_t token;
-    double   ms;
-    uint32_t events;
-    uint32_t experts_pool;   /* served from a GPU VRAM bank */
-    uint32_t experts_arena;  /* copied from pinned host RAM  */
-    uint32_t experts_ssd;    /* read from the model file     */
-    uint32_t experts_cpu;    /* computed on the CPU          */
-    uint32_t compute_ops;    /* compute start events         */
-    int      dev_n;
-    ds4_prof_dev_state dev[DS4_PEV_DEV_MAX];
-} ds4_prof_token_rec;
-
-int ds4_profiler_token_rec_snapshot(ds4_prof_token_rec *out, int max);
-
 /* Prefill is measured per sync call, not per token.  `chunks` is how many
  * prefill chunks the measurement covers: callers timing a single chunk pass 1,
  * callers timing a whole prompt pass the chunk count so per-chunk averages and
@@ -610,29 +590,21 @@ void ds4_profiler_reset_timing(void);
 
 void ds4_profiler_timing_snapshot(ds4_profiler_timing *out);
 
-/* Serialize devices + host tiers + timing as one JSON object. Returns bytes
- * written (excluding the NUL); never overflows buflen. */
-size_t ds4_profiler_json(char *buf, size_t buflen);
-
 /* ---- detail dump -------------------------------------------------------
  * One record, rendered start to end: its wall time, the share the measured
  * stages explain, every stage with its launch/wait split, every device before
  * and after, every expert use with the tier its bytes came from, and the
- * events in order. The text form is meant for a person or a model reading it
- * directly; the JSON form is the same data for a program. Both fit a
- * caller-supplied buffer, never overflow it, and mark a cut. `kind` is a
- * DS4_PREC_* value or -1 for every kind; `limit` <= 0 means all records.
+ * events in order. It fits a caller-supplied buffer, never overflows it, and
+ * marks a cut. `kind` is a DS4_PREC_* value or -1 for every kind; `limit` <= 0
+ * means all records.
  */
 #define DS4_PROF_DUMP_CAP (1024u * 1024u)   /* room for a full decode token */
 
 size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen);
-size_t ds4_profiler_record_dump_json(uint64_t seq, char *buf, size_t buflen);
 size_t ds4_profiler_records_dump(char *buf, size_t buflen, int kind, int limit);
-size_t ds4_profiler_records_dump_json(char *buf, size_t buflen, int kind, int limit);
 /* The whole picture in one call: rates, token split, devices, expert arena
  * reservation and fill, per-kind stage tables, then the newest records with
- * their full detail. This is what --profile-dump writes and what an external
- * process reads when it wants everything instead of poking field by field. */
+ * their full detail. This is what --profile-dump writes. */
 size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit);
 /* Human byte count: at most three decimals, largest unit that keeps the value
  * below 1024 ("512 B", "6.75 MiB", "18 GiB"). */

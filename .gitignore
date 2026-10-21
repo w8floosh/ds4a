@@ -73,7 +73,6 @@ __pycache__/
 .*.swp
 .DS_Store
 /tests/test_cpu_dot
-/tests/test_dashboard_bind
 /tests/test_tui
 /trace.jsonl
 /cufile.log

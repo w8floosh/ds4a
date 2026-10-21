@@ -18019,8 +18019,8 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
  * so there is no host->device staging copy to remove and a resident expert
  * already costs no file read. Rather than build a second store, map the
  * arena's byte budget and seed calls onto that cache and report its residency
- * and hit/miss counters as the arena, so the engine, profiler and dashboard
- * see the same tier on both backends. Inert until the engine opts in. */
+ * and hit/miss counters as the arena, so the engine and the profiler see the
+ * same tier on both backends. Inert until the engine opts in. */
 static uint64_t g_host_arena_budget_bytes;
 static uint64_t g_host_arena_expert_bytes;
 

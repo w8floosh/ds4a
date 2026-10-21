@@ -87,7 +87,7 @@ void ds4_profiler_set_host_stats(const ds4_profiler_host_stats *s) {
 }
 
 /* One row per kind of cost; see ds4_profiler.h for the category rules. The
- * label is what the dashboard shows, the hint is its tooltip. */
+ * label is what the profiler pane prints, the hint explains it. */
 static const struct {
     const char *id;
     const char *label;
@@ -272,9 +272,6 @@ static uint64_t           g_expert_next_seq;
 static double             g_trace_t0;
 static ds4_prof_dev_state g_dev_state[DS4_PEV_DEV_MAX];
 static int                g_dev_state_n;
-static ds4_prof_token_rec g_token_recs[DS4_PTREC_RING];
-static int                g_token_rec_head;
-static int                g_token_rec_count;
 
 static const char *const k_event_names[DS4_PEV_COUNT] = {
     "expert transfer start", "expert transfer end", "expert cache hit",
@@ -459,7 +456,7 @@ typedef struct {
 
 /* Device residency/VRAM sampling touches backend state. Keep it off the
  * engine thread (which may be mid-tier) by refreshing a cache from a detached
- * telemetry thread; the TUI and the HTTP serializer only read the cache. */
+ * telemetry thread; the TUI and the report only read the cache. */
 static ds4_profiler_stats g_cached_stats;
 static int                g_stats_started;
 static pthread_once_t     g_stats_once = PTHREAD_ONCE_INIT;
@@ -925,9 +922,7 @@ void ds4_profiler_token_end(uint64_t tokens) {
 
     ds4_prof_record rec;
     memset(&rec, 0, sizeof(rec));
-    ds4_prof_token_rec legacy;
-    memset(&legacy, 0, sizeof(legacy));
-    uint32_t pool = 0, arena = 0, ssd = 0, cpu = 0;
+
 
     LOCK();
     if (!g_cur.open) { UNLOCK(); return; }
@@ -977,52 +972,16 @@ void ds4_profiler_token_end(uint64_t tokens) {
         rec.tier_rx_bytes[t] = counter_delta(m1.rx_bytes[t], g_cur.m0.rx_bytes[t]);
     }
 
-    for (uint32_t i = 0; i < rec.expert_n; i++) {
-        const uint64_t sq = g_cur.expert_first + i;
-        const ds4_prof_expert_trace *x = &g_experts[sq % DS4_PTRACE_EXPERT_RING];
-        if (x->rec_seq != rec.seq) continue;
-        switch (x->source) {
-        case DS4_PTRACE_SRC_POOL:  pool++;  break;
-        case DS4_PTRACE_SRC_ARENA: arena++; break;
-        case DS4_PTRACE_SRC_SSD:   ssd++;   break;
-        default:                   cpu++;   break;
-        }
-    }
-
     g_records[rec.seq % DS4_PROF_REC_RING] = rec;
     g_rec_head = (int)((rec.seq + 1) % DS4_PROF_REC_RING);
     if (g_rec_count < DS4_PROF_REC_RING) g_rec_count++;
     for (int i = 0; i < g_stage_n; i++) stage_reset_accum(&g_stages[i]);
 
-    legacy.token = rec.token == UINT32_MAX ? 0 : rec.token;
-    legacy.ms = rec.ms / (double)tokens;
-    legacy.events = rec.event_n;
-    legacy.experts_pool = pool;
-    legacy.experts_arena = arena;
-    legacy.experts_ssd = ssd;
-    legacy.experts_cpu = cpu;
-    legacy.dev_n = devs1.dev_n;
-    for (int i = 0; i < devs1.dev_n; i++) legacy.dev[i] = devs1.dev[i];
-    g_token_recs[g_token_rec_head] = legacy;
-    g_token_rec_head = (g_token_rec_head + 1) % DS4_PTREC_RING;
-    if (g_token_rec_count < DS4_PTREC_RING) g_token_rec_count++;
     UNLOCK();
 
     dev_state_publish(devs1.dev, devs1.dev_n);
     trace_write_record(&rec);
     timing_note_token(tokens, self_ns);
-}
-
-int ds4_profiler_token_rec_snapshot(ds4_prof_token_rec *out, int max) {
-    if (!out || max <= 0) return 0;
-    int n = 0;
-    LOCK();
-    const int count = g_token_rec_count;
-    const int start = (g_token_rec_head - count + DS4_PTREC_RING) % DS4_PTREC_RING;
-    for (int i = 0; i < count && n < max; i++)
-        out[n++] = g_token_recs[(start + i) % DS4_PTREC_RING];
-    UNLOCK();
-    return n;
 }
 
 const char *ds4_profiler_record_kind_name(int kind) {
@@ -1183,9 +1142,6 @@ void ds4_profiler_reset_timing(void) {
     g_event_next_seq = 0;
     memset(g_events, 0, sizeof(g_events));
     g_trace_token = 0;
-    g_token_rec_head = 0;
-    g_token_rec_count = 0;
-    memset(g_token_recs, 0, sizeof(g_token_recs));
     g_tok_open = 0;
     UNLOCK();
 }
@@ -1494,452 +1450,12 @@ static void jfmt(jbuf *j, const char *fmt, ...) {
     else j->n += (size_t)w;
 }
 
-static void jstr(jbuf *j, const char *s) {
-    jraw(j, "\"");
-    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
-        switch (*p) {
-        case '"':  jraw(j, "\\\""); break;
-        case '\\': jraw(j, "\\\\"); break;
-        case '\n': jraw(j, "\\n");  break;
-        case '\r': jraw(j, "\\r");  break;
-        case '\t': jraw(j, "\\t");  break;
-        default:
-            if (*p < 0x20) jfmt(j, "\\u%04x", *p);
-            else { char c[2] = { (char)*p, 0 }; jraw(j, c); }
-        }
-    }
-    jraw(j, "\"");
-}
-
 /* Terminate a jbuf and return its length. jraw does not NUL-terminate, so
  * every dump that can end with a literal has to close the string itself. */
 static size_t jdone(jbuf *j) {
     if (j->cap) j->buf[j->n < j->cap ? j->n : j->cap - 1u] = '\0';
     return j->n;
 }
-
-static void jstat(jbuf *j, const char *key, const ds4_prof_stat *s) {
-    jfmt(j, "\"%s\":{\"last\":%.3f,\"min\":%.3f,\"max\":%.3f,\"average\":%.3f,"
-             "\"samples\":%llu}",
-         key, s->last, s->n ? s->min : 0.0, s->max, ds4_prof_avg(s),
-         (unsigned long long)s->n);
-}
-
-static void jbytes(jbuf *j, const char *key, uint64_t v) {
-    jfmt(j, "\"%s\":%llu", key, (unsigned long long)v);
-}
-
-static uint64_t host_ram_total_bytes(void) {
-#if !defined(_WIN32)
-    const long pages = sysconf(_SC_PHYS_PAGES);
-    const long psize = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && psize > 0) return (uint64_t)pages * (uint64_t)psize;
-#endif
-    return 0;
-}
-
-/* VRAM composition. Every consumer we track gets its own field; the residual
- * ("other") is then only external processes (desktop, browser, the CUDA
- * driver/context) plus anything untracked. `tensor` and `pool` can overlap the
- * specific parts and reserved can exceed used, so they are trimmed first so the
- * parts sum to the measured used VRAM. */
-typedef struct {
-    uint64_t dense, arena, kv, experts, scratch, temp, tensors, pool, other, sum;
-} vram_parts;
-
-static vram_parts vram_split(const ds4_profiler_device *d, uint64_t host_kv) {
-    vram_parts p;
-    memset(&p, 0, sizeof(p));
-    const uint64_t kv = d->device_id == 0 ? host_kv : 0;  /* KV lives on tier 0 */
-    uint64_t wgt = d->dense_bytes + d->derived_bytes;
-    uint64_t tens = d->tensor_bytes > kv ? d->tensor_bytes - kv : 0;
-    uint64_t pool = d->mempool_bytes;
-    const uint64_t base = wgt + d->arena_bytes + kv + d->expert_bytes +
-                          d->scratch_bytes + d->temp_bytes;
-    uint64_t over = base > d->vram_used_bytes ? base - d->vram_used_bytes : 0;
-    if (over != 0) { const uint64_t t = tens < over ? tens : over; tens -= t; over -= t; }
-    if (over != 0) {
-        const uint64_t q = pool < over ? pool : over;
-        pool -= q; over -= q;
-        if (over != 0) wgt = wgt > over ? wgt - over : 0;
-    }
-    const uint64_t known = wgt + d->arena_bytes + kv + d->expert_bytes +
-                           d->scratch_bytes + d->temp_bytes + tens + pool;
-    p.dense = wgt;
-    p.arena = d->arena_bytes;
-    p.kv = kv;
-    p.experts = d->expert_bytes;
-    p.scratch = d->scratch_bytes;
-    p.temp = d->temp_bytes;
-    p.tensors = tens;
-    p.pool = pool;
-    p.other = d->vram_used_bytes > known ? d->vram_used_bytes - known : 0;
-    p.sum = d->vram_used_bytes;
-    return p;
-}
-
-size_t ds4_profiler_json(char *buf, size_t buflen) {
-    if (!buf || buflen == 0) return 0;
-    jbuf j = { buf, buflen, 0 };
-    buf[0] = '\0';
-
-    ds4_profiler_stats s;
-    stats_snapshot_cached(&s);
-
-    ds4_profiler_timing t;
-    ds4_profiler_host_stats h;
-    LOCK();
-    t = g_timing;
-    h = g_host;
-    UNLOCK();
-    if (h.host_ram_total_bytes == 0) h.host_ram_total_bytes = host_ram_total_bytes();
-
-    jraw(&j, "{");
-
-    /* Expert distribution across the three tiers. */
-    uint64_t gpu_experts = 0;
-    for (int i = 0; i < s.n_devices; i++) gpu_experts += s.dev[i].expert_count;
-    const uint64_t total = h.total_experts;
-    uint64_t ram = s.host_experts_resident;
-    uint64_t ram_bytes = h.ram_bytes;
-    if (s.host_arena_capacity_bytes != 0) {
-        /* The pinned arena is the host expert cache; report what it actually
-         * holds rather than the page-cache budget that only guides reads. */
-        ram = s.host_arena_experts;
-        ram_bytes = s.host_arena_used_bytes;
-    }
-    const uint64_t ssd = total > gpu_experts + ram ? total - gpu_experts - ram : 0;
-    jraw(&j, "\"expert_distribution\":{");
-    jbytes(&j, "total", total);      jraw(&j, ",");
-    jbytes(&j, "on_gpu", gpu_experts); jraw(&j, ",");
-    jbytes(&j, "in_host_ram", ram);  jraw(&j, ",");
-    jbytes(&j, "on_ssd", ssd);       jraw(&j, ",");
-    jbytes(&j, "bytes_per_expert", h.expert_bytes);
-    jraw(&j, "},");
-
-    jraw(&j, "\"host\":{");
-    jfmt(&j, "\"has_ssd\":%d,", h.has_ssd ? 1 : 0);
-    jfmt(&j, "\"has_ram\":%d,",
-         (h.has_ram || s.host_arena_capacity_bytes != 0) ? 1 : 0);
-    jbytes(&j, "model_bytes", h.model_bytes);       jraw(&j, ",");
-    jbytes(&j, "ram_bytes", ram_bytes);             jraw(&j, ",");
-    jbytes(&j, "ram_total_bytes", h.host_ram_total_bytes); jraw(&j, ",");
-    jbytes(&j, "ram_experts", ram);                 jraw(&j, ",");
-    jbytes(&j, "arena_capacity_bytes", s.host_arena_capacity_bytes); jraw(&j, ",");
-    jbytes(&j, "arena_used_bytes", s.host_arena_used_bytes); jraw(&j, ",");
-    jbytes(&j, "arena_experts", s.host_arena_experts); jraw(&j, ",");
-    jbytes(&j, "arena_hits", s.host_arena_hits);    jraw(&j, ",");
-    jbytes(&j, "arena_misses", s.host_arena_misses); jraw(&j, ",");
-    jbytes(&j, "arena_admissions", s.host_arena_admissions); jraw(&j, ",");
-    jbytes(&j, "arena_admission", s.host_arena_admission); jraw(&j, ",");
-    jbytes(&j, "arena_evictions", s.host_arena_evictions); jraw(&j, ",");
-    jbytes(&j, "arena_evicted_fetches", s.host_arena_evicted_fetches); jraw(&j, ",");
-    jbytes(&j, "kv_bytes", h.kv_bytes);             jraw(&j, ",");
-    jbytes(&j, "ssd_read_bytes", s.ssd_read_bytes); jraw(&j, ",");
-    jraw(&j, "\"dense\":[");
-    for (int c = 0; c < h.dense_n && c < DS4_PROFILER_DENSE_CATS; c++) {
-        if (c) jraw(&j, ",");
-        jraw(&j, "{\"name\":");
-        jstr(&j, h.dense[c].name);
-        jfmt(&j, ",\"bytes\":%llu}", (unsigned long long)h.dense[c].bytes);
-    }
-    jraw(&j, "]},");
-
-    /* Timing. */
-    jraw(&j, "\"timing\":{");
-    jstat(&j, "per_token_ms", &t.per_token_ms);              jraw(&j, ",");
-    jstat(&j, "host_ms", &t.host_ms);                        jraw(&j, ",");
-    jstat(&j, "host_read_ms", &t.host_read_ms);              jraw(&j, ",");
-    jstat(&j, "device_wait_ms", &t.device_wait_ms);          jraw(&j, ",");
-    jstat(&j, "device_upload_ms", &t.device_upload_ms);      jraw(&j, ",");
-    jstat(&j, "device_readback_ms", &t.device_readback_ms);  jraw(&j, ",");
-    jstat(&j, "device_sync_ms", &t.device_sync_ms);          jraw(&j, ",");
-    jstat(&j, "profiler_ms", &t.profiler_ms);                jraw(&j, ",");
-    jstat(&j, "profiler_sync_ms", &t.profiler_sync_ms);      jraw(&j, ",");
-    jstat(&j, "weight_transfer_ms", &t.weight_transfer_ms);  jraw(&j, ",");
-    jstat(&j, "activation_transfer_ms", &t.activation_transfer_ms); jraw(&j, ",");
-    jstat(&j, "tokens_per_s", &t.tokens_per_s);              jraw(&j, ",");
-    jstat(&j, "prefill_ms", &t.prefill_ms);                  jraw(&j, ",");
-    jstat(&j, "prefill_tokens_per_s", &t.prefill_tokens_per_s); jraw(&j, ",");
-    jfmt(&j, "\"tokens\":%llu", (unsigned long long)t.tokens);
-    jfmt(&j, ",\"prefill_tokens\":%llu", (unsigned long long)t.prefill_tokens);
-    jraw(&j, "},");
-
-    /* Per-step timeline: one row per kind of cost, carrying its own label,
-     * category and tooltip so the dashboard needs no second copy of the table.
-     * Rows with no samples are omitted rather than shown as zero. */
-    jraw(&j, "\"steps\":[");
-    {
-        ds4_prof_step_stat st[DS4_PSTEP_COUNT];
-        ds4_profiler_step_snapshot(st, DS4_PSTEP_COUNT);
-        const double tk = t.tokens ? (double)t.tokens : 0.0;
-        int first = 1;
-        for (int i = 0; i < DS4_PSTEP_COUNT; i++) {
-            if (st[i].ns == 0 && st[i].count == 0 && st[i].bytes == 0) continue;
-            const double ms = tk > 0 ? (double)st[i].ns / 1e6 / tk : 0.0;
-            if (!first) jraw(&j, ",");
-            first = 0;
-            jraw(&j, "{");
-            jraw(&j, "\"id\":");       jstr(&j, ds4_profiler_step_id((ds4_prof_step)i));
-            jraw(&j, ",\"label\":");   jstr(&j, ds4_profiler_step_label((ds4_prof_step)i));
-            jraw(&j, ",\"category\":");jstr(&j, ds4_profiler_step_category((ds4_prof_step)i));
-            jraw(&j, ",\"hint\":");    jstr(&j, ds4_profiler_step_hint((ds4_prof_step)i));
-            jfmt(&j, ",\"ms_per_token\":%.3f", ms);
-            jfmt(&j, ",\"pct_of_token\":%.1f",
-                 (t.per_token_ms.sum > 0.0 && tk > 0)
-                     ? 100.0 * ms / t.per_token_ms.sum : 0.0);
-            jfmt(&j, ",\"calls_per_token\":%.1f", tk > 0 ? (double)st[i].count / tk : 0.0);
-            jfmt(&j, ",\"bytes_per_token\":%.0f", tk > 0 ? (double)st[i].bytes / tk : 0.0);
-            jfmt(&j, ",\"gb_per_s\":%.2f",
-                 st[i].ns > 0 ? (double)st[i].bytes / (double)st[i].ns : 0.0);
-            jraw(&j, "}");
-        }
-    }
-    jraw(&j, "],");
-
-    /* Stage rows: one row per scheduler stage, carrying its measured
-     * CPU-launch / device-wait split. Never merged with another stage. */
-    jraw(&j, "\"stage_rows\":[");
-    {
-        ds4_prof_view view;
-        memset(&view, 0, sizeof(view));
-        (void)ds4_profiler_view(&view);
-        const int n = view.n_stages < DS4_PROF_MAX_STAGES
-            ? view.n_stages : DS4_PROF_MAX_STAGES;
-        const double tk = t.tokens ? (double)t.tokens : 0.0;
-        /* Kind denominators: decode shares divide by decode tokens, prefill
-         * shares by prefill tokens. Mixing them was what made the shares of a
-         * label sum past 100%. */
-        double kind_tokens[DS4_PREC_KIND_MAX];
-        kind_tokens[DS4_PREC_DECODE_TOKEN] = tk;
-        kind_tokens[DS4_PREC_PREFILL_CHUNK] = (double)t.prefill_tokens;
-        kind_tokens[DS4_PREC_PREFILL_TOKEN] = tk;
-        double kind_total_ms[DS4_PREC_KIND_MAX] = {0};
-        for (int i = 0; i < n; i++) {
-            for (int k = 0; k < DS4_PREC_KIND_MAX; k++) {
-                kind_total_ms[k] += view.stages[i].kind[k].total_ms;
-            }
-        }
-        int first = 1;
-        for (int i = 0; i < n; i++) {
-            const ds4_prof_stage_view *sv = &view.stages[i];
-            if (sv->total_ms.n == 0 && sv->calls == 0 && sv->bytes == 0) continue;
-            if (!first) jraw(&j, ",");
-            first = 0;
-            jraw(&j, "{");
-            jraw(&j, "\"key\":");      jstr(&j, sv->key);
-            jraw(&j, ",\"label\":");   jstr(&j, sv->label);
-            jraw(&j, ",\"category\":");jstr(&j, sv->category);
-            jraw(&j, ",\"hint\":");    jstr(&j, sv->hint);
-            /* Per-kind rows: the same boundary measured on a decode token and
-             * on a prefill chunk keeps its own average and its own share. */
-            jraw(&j, ",\"kinds\":{");
-            for (int k = 0; k < DS4_PREC_KIND_MAX; k++) {
-                const ds4_prof_stage_kind *kv = &sv->kind[k];
-                if (kv->calls == 0 && kv->total_ms <= 0.0) continue;
-                const double kt = kind_tokens[k];
-                if (k > 0) jraw(&j, ",");
-                jraw(&j, "\"");
-                jraw(&j, k == DS4_PREC_DECODE_TOKEN ? "decode"
-                     : k == DS4_PREC_PREFILL_CHUNK ? "prefill_chunk"
-                                                   : "prefill_token");
-                jraw(&j, "\":{");
-                jfmt(&j, "\"ms\":%.3f", kv->total_ms);
-                jfmt(&j, ",\"ms_per_unit\":%.4f", kt > 0 ? kv->total_ms / kt : 0.0);
-                jfmt(&j, ",\"encode_ms_per_unit\":%.4f", kt > 0 ? kv->encode_ms / kt : 0.0);
-                jfmt(&j, ",\"wait_ms_per_unit\":%.4f", kt > 0 ? kv->wait_ms / kt : 0.0);
-                jfmt(&j, ",\"share_pct\":%.2f",
-                     kind_total_ms[k] > 0.0
-                         ? 100.0 * kv->total_ms / kind_total_ms[k] : 0.0);
-                jfmt(&j, ",\"calls\":%llu", (unsigned long long)kv->calls);
-                jfmt(&j, ",\"bytes\":%llu", (unsigned long long)kv->bytes);
-                jraw(&j, "}");
-            }
-            jraw(&j, "},");
-            jfmt(&j, "\"total_ms_per_token\":%.4f",
-                 tk > 0 ? sv->total_ms.sum / tk : 0.0);
-            jfmt(&j, ",\"encode_ms_per_token\":%.4f",
-                 tk > 0 ? sv->encode_ms.sum / tk : 0.0);
-            jfmt(&j, ",\"wait_ms_per_token\":%.4f",
-                 tk > 0 ? sv->wait_ms.sum / tk : 0.0);
-            jfmt(&j, ",\"last_ms\":%.4f", sv->total_ms.last);
-            jfmt(&j, ",\"min_ms\":%.4f", sv->total_ms.n ? sv->total_ms.min : 0.0);
-            jfmt(&j, ",\"max_ms\":%.4f", sv->total_ms.max);
-            jfmt(&j, ",\"calls_per_token\":%.2f",
-                 tk > 0 ? (double)sv->calls / tk : 0.0);
-            jfmt(&j, ",\"bytes_per_token\":%.0f",
-                 tk > 0 ? (double)sv->bytes / tk : 0.0);
-            jfmt(&j, ",\"gb_per_s\":%.3f",
-                 sv->total_ms.sum > 0.0
-                     ? (double)sv->bytes / (sv->total_ms.sum * 1e6) : 0.0);
-            jraw(&j, "}");
-        }
-    }
-    jraw(&j, "],");
-
-    /* Expert trace: the last two tokens verbatim, one record per expert use,
-     * with its source and destination so the dashboard can show residency and
-     * transfer without reading the engine's internals. */
-    jraw(&j, "\"expert_trace\":[");
-    {
-        const int cap = 4096;
-        ds4_prof_expert_trace *tr = malloc((size_t)cap * sizeof(*tr));
-        const int n = tr ? ds4_profiler_trace_snapshot(tr, cap) : 0;
-        uint32_t last_tokens[2] = {0, 0};
-        int seen = 0;
-        for (int i = n - 1; i >= 0 && seen < 2; i--) {
-            if (seen == 0 || tr[i].token != last_tokens[seen - 1]) {
-                last_tokens[seen++] = tr[i].token;
-            }
-        }
-        int first = 1;
-        for (int i = 0; i < n; i++) {
-            const uint32_t tk = tr[i].token;
-            if (tk != last_tokens[0] && (seen < 2 || tk != last_tokens[1])) continue;
-            if (!first) jraw(&j, ",");
-            first = 0;
-            jfmt(&j, "{\"token\":%u,\"layer\":%u,\"expert\":%u,\"source\":%u,"
-                     "\"src_gpu\":%u,\"dest_gpu\":%u,\"bytes\":%u}",
-                 tk, (unsigned)tr[i].layer, (unsigned)tr[i].expert,
-                 (unsigned)tr[i].source, (unsigned)tr[i].src_gpu,
-                 (unsigned)tr[i].dest_gpu, (unsigned)tr[i].bytes);
-        }
-        free(tr);
-    }
-    jraw(&j, "],");
-
-    /* Compact record list. The TUI reads full records directly; the web page
-     * only needs this list plus events for the newest record. */
-    jraw(&j, "\"records\":[");
-    {
-        ds4_prof_record_meta recs[DS4_PROF_REC_RING];
-        const int n = ds4_profiler_record_list(recs, DS4_PROF_REC_RING);
-        for (int i = 0; i < n; i++) {
-            const ds4_prof_record_meta *r = &recs[i];
-            if (i) jraw(&j, ",");
-            jfmt(&j, "{\"seq\":%llu,\"kind\":\"%s\",\"token\":%u,\"pos\":%d,"
-                     "\"tokens\":%u,\"ms\":%.3f,\"events\":%u,\"experts\":%u,"
-                     "\"hot_stage\":%u,\"hot_ms\":%.3f,"
-                     "\"pool\":%u,\"arena\":%u,\"ssd\":%u,\"cpu\":%u,"
-                     "\"util_max\":%u,\"text\":\"%s\"}",
-                 (unsigned long long)r->seq,
-                 ds4_profiler_record_kind_name(r->kind), r->token, r->pos,
-                 r->n_tokens, r->ms, r->events, r->experts, r->hot_stage,
-                 r->hot_ms, r->experts_pool, r->experts_arena,
-                 r->experts_ssd, r->experts_cpu, r->util_max, r->text);
-        }
-    }
-    jraw(&j, "],");
-
-    /* Per-token records + the newest token's ordered events: the dashboard's
-     * token list and timeline read from here. */
-    jraw(&j, "\"tokens\":[");
-    {
-        ds4_prof_token_rec recs[DS4_PTREC_RING];
-        const int n = ds4_profiler_token_rec_snapshot(recs, DS4_PTREC_RING);
-        uint32_t newest = 0;
-        for (int i = 0; i < n; i++) {
-            const ds4_prof_token_rec *r = &recs[i];
-            if (i) jraw(&j, ",");
-            jfmt(&j, "{\"token\":%u,\"ms\":%.2f,\"events\":%u,"
-                     "\"pool\":%u,\"arena\":%u,\"ssd\":%u,\"cpu\":%u,"
-                     "\"compute\":%u,\"devices\":[",
-                 r->token, r->ms, r->events, r->experts_pool,
-                 r->experts_arena, r->experts_ssd, r->experts_cpu,
-                 r->compute_ops);
-            for (int d = 0; d < r->dev_n; d++) {
-                if (d) jraw(&j, ",");
-                jfmt(&j, "{\"dev\":%d,\"name\":\"%s\",\"util\":%u,"
-                         "\"mem_used\":%llu,\"mem_total\":%llu}",
-                     r->dev[d].device, r->dev[d].name, r->dev[d].util_pct,
-                     (unsigned long long)r->dev[d].mem_used,
-                     (unsigned long long)r->dev[d].mem_total);
-            }
-            jraw(&j, "]}");
-            newest = r->token;
-        }
-        jraw(&j, "],\"events\":[");
-        ds4_prof_record_meta rm[DS4_PROF_REC_RING];
-        const int rn = ds4_profiler_record_list(rm, DS4_PROF_REC_RING);
-        const uint64_t newest_seq = rn > 0 ? rm[rn - 1].seq : UINT64_MAX;
-        const int cap = 4096;
-        ds4_prof_event *ev = malloc((size_t)cap * sizeof(*ev));
-        const int en = ev ? ds4_profiler_record_events(newest_seq, ev, cap) : 0;
-        for (int i = 0; i < en; i++) {
-            if (i) jraw(&j, ",");
-            jfmt(&j, "{\"us\":%u,\"ns\":%u,\"k\":\"%s\",\"layer\":%u,"
-                     "\"expert\":%u,\"dev\":%u,\"bytes\":%u}",
-                 ev[i].t_us, ev[i].dur_ns,
-                 ds4_profiler_event_kind(ev[i].kind),
-                 (unsigned)ev[i].layer, (unsigned)ev[i].expert,
-                 (unsigned)ev[i].device, ev[i].bytes);
-        }
-        free(ev);
-        (void)newest;
-    }
-    jraw(&j, "],");
-
-    /* Per-device rows. */
-    jraw(&j, "\"devices\":[");
-    for (int i = 0; i < s.n_devices; i++) {
-        const ds4_profiler_device *d = &s.dev[i];
-        const vram_parts p = vram_split(d, h.kv_bytes);
-        if (i) jraw(&j, ",");
-        jraw(&j, "{");
-        jfmt(&j, "\"tier\":%d,", i);
-        jfmt(&j, "\"device_id\":%d,", d->device_id);
-        jbytes(&j, "vram_used_bytes", d->vram_used_bytes);   jraw(&j, ",");
-        jbytes(&j, "vram_total_bytes", d->vram_total_bytes); jraw(&j, ",");
-        jbytes(&j, "dense_bytes", p.dense);       jraw(&j, ",");
-        jbytes(&j, "arena_bytes", p.arena);       jraw(&j, ",");
-        jbytes(&j, "kv_bytes", p.kv);             jraw(&j, ",");
-        jbytes(&j, "expert_bytes", p.experts);    jraw(&j, ",");
-        jbytes(&j, "scratch_bytes", p.scratch);   jraw(&j, ",");
-        jbytes(&j, "temp_bytes", p.temp);         jraw(&j, ",");
-        jbytes(&j, "tensor_bytes", p.tensors);    jraw(&j, ",");
-        jbytes(&j, "pool_bytes", p.pool);         jraw(&j, ",");
-        jbytes(&j, "other_bytes", p.other);       jraw(&j, ",");
-        jbytes(&j, "vram_sum_bytes", p.sum);      jraw(&j, ",");
-        jbytes(&j, "expert_count", d->expert_count);       jraw(&j, ",");
-        jbytes(&j, "expert_size_bytes", d->expert_size_bytes); jraw(&j, ",");
-        jbytes(&j, "weight_bytes", d->weight_bytes);       jraw(&j, ",");
-        jbytes(&j, "activation_bytes", d->activation_bytes); jraw(&j, ",");
-        jbytes(&j, "pcie_tx_bytes", d->pcie_tx_bytes);     jraw(&j, ",");
-        jbytes(&j, "pcie_rx_bytes", d->pcie_rx_bytes);     jraw(&j, ",");
-        jbytes(&j, "pcie_peak_bytes_per_s", d->pcie_max_bytes_per_s); jraw(&j, ",");
-        jraw(&j, "\"name\":"); jstr(&j, d->name);              jraw(&j, ",");
-        jbytes(&j, "mem_bw_bytes_per_s", d->mem_bw_bytes_per_s); jraw(&j, ",");
-        jbytes(&j, "compute_flops_fp16", d->compute_flops_fp16); jraw(&j, ",");
-        jfmt(&j, "\"sm_count\":%u,", d->sm_count);
-        jfmt(&j, "\"pcie_gen\":%d,", d->pcie_gen);
-        jfmt(&j, "\"pcie_width\":%d,", d->pcie_width);
-        jfmt(&j, "\"tensor_gen\":%d,", d->tensor_gen);
-        jfmt(&j, "\"p2p\":%d,", d->p2p ? 1 : 0);
-        jfmt(&j, "\"nvlink\":%d,", d->nvlink ? 1 : 0);
-        jraw(&j, "\"weight_type\":"); jstr(&j, d->type);       jraw(&j, ",");
-        jraw(&j, "\"expert_type\":"); jstr(&j, d->expert_type);
-        jraw(&j, "}");
-    }
-    jraw(&j, "]");
-
-    jraw(&j, "}");
-    return j.n;
-}
-
-/* ---- detail dump ---------------------------------------------------------
- * The profiler's answer to "what happened inside this token". One record is
- * rendered start to end from the record itself plus its event and expert
- * rings: every measured stage with its launch/wait split and its share, every
- * device as it was before and after, every expert use with the tier its bytes
- * came from. The stage capture cannot bracket everything, so the discussed
- * sum is compared against the record's wall time and the difference is printed
- * as an explicit "unmeasured" line rather than being folded into a stage.
- *
- * Two renderings of the same data: text, which a person or a model reads
- * directly, and JSON, which the dashboard and any other process consumes.
- * Both write into a caller-provided buffer, never overflow it, and mark the
- * cut when the buffer was too small.
- */
 
 #define DUMP_TRUNC "\n[truncated: buffer too small]\n"
 
@@ -2190,118 +1706,6 @@ size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen) {
     return jdone(&o);
 }
 
-size_t ds4_profiler_record_dump_json(uint64_t seq, char *buf, size_t buflen) {
-    if (!buf || buflen == 0) return 0;
-    buf[0] = '\0';
-    ds4_prof_record r;
-    jbuf j = { buf, buflen, 0 };
-    if (!ds4_profiler_record_get(seq, &r)) {
-        jfmt(&j, "{\"error\":\"no profiler record with seq %llu\"}",
-             (unsigned long long)seq);
-        return j.n;
-    }
-    const int max_ev = 16384, max_x = 8192;
-    ds4_prof_event *ev = malloc((size_t)max_ev * sizeof(*ev));
-    ds4_prof_expert_trace *xs = malloc((size_t)max_x * sizeof(*xs));
-    const int n_ev = ev ? ds4_profiler_record_events(seq, ev, max_ev) : 0;
-    const int n_x = xs ? ds4_profiler_record_experts(seq, xs, max_x) : 0;
-    double unexplained = 0.0;
-    const double expl = rec_explained_ms(&r, &unexplained);
-
-    jfmt(&j, "{\"seq\":%llu,", (unsigned long long)r.seq);
-    jraw(&j, "\"kind\":"); jstr(&j, ds4_profiler_record_kind_name(r.kind));
-    jfmt(&j, ",\"kind_id\":%u", r.kind);
-    jfmt(&j, ",\"closed\":%u", r.closed ? 1u : 0u);
-    jfmt(&j, ",\"pos\":%d", r.pos);
-    jfmt(&j, ",\"n_tokens\":%u", r.n_tokens);
-    jfmt(&j, ",\"token\":%u", r.token);
-    jraw(&j, ",\"text\":"); jstr(&j, r.text);
-    jfmt(&j, ",\"ms\":%.4f", r.ms);
-    jfmt(&j, ",\"explained_ms\":%.4f", expl);
-    jfmt(&j, ",\"unexplained_ms\":%.4f", unexplained);
-    jfmt(&j, ",\"ssd_read_bytes\":%llu", (unsigned long long)r.ssd_read_bytes);
-    jfmt(&j, ",\"host_ram_used\":%llu", (unsigned long long)r.host_ram_used);
-    jfmt(&j, ",\"host_ram_avail\":%llu", (unsigned long long)r.host_ram_avail);
-    jfmt(&j, ",\"proc_cpu_ns\":%llu", (unsigned long long)r.proc_cpu_ns);
-    jfmt(&j, ",\"sys_cpu_busy_ns\":%llu", (unsigned long long)r.sys_cpu_busy_ns);
-    jfmt(&j, ",\"sys_cpu_total_ns\":%llu", (unsigned long long)r.sys_cpu_total_ns);
-
-    jraw(&j, ",\"devices\":[");
-    for (uint32_t i = 0; i < r.dev_n; i++) {
-        const ds4_prof_rec_dev *d = &r.dev[i];
-        if (i) jraw(&j, ",");
-        jfmt(&j, "{\"device\":%d,\"util_start\":%u,\"util_end\":%u,"
-                 "\"mem_start\":%llu,\"mem_end\":%llu}",
-             d->device, d->util_start, d->util_end,
-             (unsigned long long)d->mem_start, (unsigned long long)d->mem_end);
-    }
-    jraw(&j, "],");
-
-    const ds4_prof_stage_use *sorted[DS4_PROF_REC_MAX_STAGES];
-    const uint32_t ns = r.stage_n < DS4_PROF_REC_MAX_STAGES
-        ? r.stage_n : DS4_PROF_REC_MAX_STAGES;
-    for (uint32_t i = 0; i < ns; i++) sorted[i] = &r.stages[i];
-    qsort(sorted, ns, sizeof(sorted[0]), rec_stage_cmp);
-    const uint64_t sum_ns = (uint64_t)(expl * 1e6);
-    jraw(&j, "\"stages\":[");
-    for (uint32_t i = 0; i < ns; i++) {
-        const ds4_prof_stage_use *u = sorted[i];
-        char kb[48], lb[64], cb[24];
-        dump_stage_meta(u->id, kb, sizeof(kb), lb, sizeof(lb), cb, sizeof(cb));
-        if (i) jraw(&j, ",");
-        jraw(&j, "{\"key\":");   jstr(&j, kb);
-        jraw(&j, ",\"label\":"); jstr(&j, lb);
-        jraw(&j, ",\"category\":"); jstr(&j, cb);
-        jfmt(&j, ",\"total_ms\":%.4f", (double)u->total_ns / 1e6);
-        jfmt(&j, ",\"launch_ms\":%.4f", (double)u->encode_ns / 1e6);
-        jfmt(&j, ",\"wait_ms\":%.4f", (double)u->wait_ns / 1e6);
-        jfmt(&j, ",\"calls\":%llu", (unsigned long long)u->count);
-        jfmt(&j, ",\"bytes\":%llu", (unsigned long long)u->bytes);
-        jfmt(&j, ",\"share_pct\":%.2f",
-             sum_ns ? 100.0 * (double)u->total_ns / (double)sum_ns : 0.0);
-        jraw(&j, "}");
-    }
-    jraw(&j, "],");
-
-    uint64_t p, a, s, c;
-    dump_expert_counts(xs, n_x, &p, &a, &s, &c);
-    jfmt(&j, "\"experts\":{\"count\":%d,\"total\":%u,\"gpu_pool\":%llu,"
-             "\"host_arena\":%llu,\"ssd\":%llu,\"cpu\":%llu,\"uses\":[",
-         n_x, r.expert_n, (unsigned long long)p, (unsigned long long)a,
-         (unsigned long long)s, (unsigned long long)c);
-    for (int i = 0; i < n_x; i++) {
-        const ds4_prof_expert_trace *x = &xs[i];
-        if (i) jraw(&j, ",");
-        jraw(&j, "{\"layer\":");
-        jfmt(&j, "%u", x->layer);
-        jraw(&j, ",\"expert\":");
-        jfmt(&j, "%u", x->expert);
-        jraw(&j, ",\"source\":");
-        jstr(&j, dump_src_name(x->source));
-        jfmt(&j, ",\"src_gpu\":%d,\"dest_gpu\":%d,\"bytes\":%u}",
-             x->src_gpu == 0xff ? -1 : (int)x->src_gpu,
-             x->dest_gpu == 0xff ? -1 : (int)x->dest_gpu, x->bytes);
-    }
-    jraw(&j, "]},");
-
-    jfmt(&j, "\"events\":{\"count\":%d,\"total\":%u,\"items\":[", n_ev, r.event_n);
-    for (int i = 0; i < n_ev; i++) {
-        const ds4_prof_event *e = &ev[i];
-        if (i) jraw(&j, ",");
-        jraw(&j, "{\"kind\":");
-        jstr(&j, ds4_profiler_event_kind(e->kind));
-        jfmt(&j, ",\"t_us\":%u,\"dur_ns\":%u,\"stage\":%u,\"layer\":%u,"
-                 "\"expert\":%u,\"device\":%u,\"bytes\":%u}",
-             e->t_us, e->dur_ns, e->stage, e->layer, e->expert, e->device,
-             e->bytes);
-    }
-    jraw(&j, "]}");
-    jraw(&j, "}");
-    free(ev);
-    free(xs);
-    return jdone(&j);
-}
-
 /* Newest-first list of live records, optionally filtered by kind. `kind` is a
  * DS4_PREC_* value, or -1 for every kind. */
 size_t ds4_profiler_records_dump(char *buf, size_t buflen, int kind, int limit) {
@@ -2331,49 +1735,12 @@ size_t ds4_profiler_records_dump(char *buf, size_t buflen, int kind, int limit) 
     return jdone(&o);
 }
 
-size_t ds4_profiler_records_dump_json(char *buf, size_t buflen, int kind,
-                                      int limit) {
-    if (!buf || buflen == 0) return 0;
-    buf[0] = '\0';
-    ds4_prof_record_meta metas[DS4_PROF_REC_RING];
-    const int n = ds4_profiler_record_list(metas, DS4_PROF_REC_RING);
-    jbuf j = { buf, buflen, 0 };
-    jraw(&j, "{\"kind\":");
-    jstr(&j, kind < 0 ? "all" : ds4_profiler_record_kind_name(kind));
-    jraw(&j, ",\"records\":[");
-    int shown = 0;
-    for (int i = n - 1; i >= 0; i--) {
-        if (kind >= 0 && (int)metas[i].kind != kind) continue;
-        if (limit > 0 && shown >= limit) break;
-        if (shown) jraw(&j, ",");
-        char kb[48], lb[64], cb[24];
-        dump_stage_meta(metas[i].hot_stage, kb, sizeof(kb), lb, sizeof(lb),
-                        cb, sizeof(cb));
-        jfmt(&j, "{\"seq\":%llu,\"kind\":",
-             (unsigned long long)metas[i].seq);
-        jstr(&j, ds4_profiler_record_kind_name(metas[i].kind));
-        jfmt(&j, ",\"pos\":%d,\"n_tokens\":%u,\"token\":%u,\"ms\":%.4f",
-             metas[i].pos, metas[i].n_tokens, metas[i].token, metas[i].ms);
-        jraw(&j, ",\"text\":"); jstr(&j, metas[i].text);
-        jraw(&j, ",\"hot_stage\":");
-        jstr(&j, lb);
-        jfmt(&j, ",\"hot_ms\":%.4f", metas[i].hot_ms);
-        jfmt(&j, ",\"events\":%u,\"experts\":%u", metas[i].events,
-             metas[i].experts);
-        jfmt(&j, ",\"experts_pool\":%u,\"experts_arena\":%u}",
-             metas[i].experts_pool, metas[i].experts_arena);
-        shown++;
-    }
-    jraw(&j, "]}");
-    return jdone(&j);
-}
-
 /* ---- full report ---------------------------------------------------------
  * Everything the profiler knows, in the order it is read: how fast, where the
  * time went (split by record kind, never merged), what the expert tiers hold,
  * then the newest records and their full detail. This is the artifact a run
- * leaves behind and the body of the HTTP text endpoint, so a caller never has
- * to assemble the picture from several probes.
+ * leaves behind (--profile-dump), so a reader never has to assemble the picture
+ * from several probes.
  */
 static void report_stage_table(jbuf *o, const ds4_prof_view *v, int kind,
                                double units, const char *unit_name) {
