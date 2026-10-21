@@ -134,14 +134,25 @@ never take the RAM the kernel needs. `--expert-arena 0` disables it. When the ar
 streaming read path drops to O_DIRECT automatically, because a page cache beside a pin would compete for
 the same RAM and hand back the prefill pollution the arena exists to remove.
 
-Start-up fills only a bounded seed (`--expert-arena-preload`, default the
-smaller of 8 GB and the arena) and the rest fills from live reads as the session
-runs. That is deliberately how the arena is meant to populate: filling from the
-session's own routing beats an offline hotlist, and while slots are still free
-every admission is additive with no eviction. On a 306-token session this reached
-11.2 tokens/s with a 6.5 ms host read, against 8.6 tokens/s and 52 ms for a full
-40 GB preload — and a 4.7 s start instead of 24 s. `--expert-arena-preload NGB`
-forces an eager fill when that is what you want.
+The pin is allocated once at start-up and never grows; it is filled from two
+sources. Start-up reads a bounded seed (`--expert-arena-preload`, default half
+the arena with an 8 GB floor), then every fetch that misses both the GPU expert
+pool and the arena claims a slot and is filed there by the read worker that was
+already fetching it, so admission costs no extra read and no extra seek. While
+free slots remain every admission is additive with no eviction; once the pin is
+full, admission needs a repeat fetch before it can displace the least-used
+resident. Filling from the session's own routing beats an offline hotlist: on a
+306-token session this reached 11.2 tokens/s with a 6.5 ms host read, against
+8.6 tokens/s and 52 ms for a full 40 GB preload — and a 4.7 s start instead of
+24 s. `--expert-arena-preload NGB` forces an eager fill when that is what you
+want.
+
+"Reserved" and "filled" are different numbers and both are reported. The free
+rest is not a fill that stalled: an expert only reaches the arena if it is
+missing everywhere else, so on a session the preload and the pool already cover,
+the free slots stay free and the pin simply has headroom for the misses that
+never came. Size `--expert-arena` for the worst case, not for what a short run
+touches.
 
 The dashboard's storage panel reports the arena's residency and split fetches
 (`arena_hits` / `arena_misses`), and, when runtime admission is on,

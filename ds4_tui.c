@@ -1328,8 +1328,11 @@ static void build_overview(ds4_tui *t) {
     doc_clear(d);
     ds4_prof_view *v = t->view;
     const ds4_profiler_timing *tm = &v->timing;
-    doc_line(d, ST_TITLE, " D %.2f t/s  %.2f ms  P %.2f t/s",
-             ds4_prof_avg(&tm->tokens_per_s), ds4_prof_avg(&tm->per_token_ms),
+    /* One home per figure: the header carries the average rates, the averages
+     * block below carries average latency and work. Printing both ms and t/s
+     * for the same series here read as two different measurements. */
+    doc_line(d, ST_TITLE, " D %.2f t/s  P %.2f t/s",
+             ds4_prof_avg(&tm->tokens_per_s),
              ds4_prof_avg(&tm->prefill_tokens_per_s));
     doc_line(d, ST_GRAY, " capture %s  n=%llu", t->granular ? "on" : "off",
              (unsigned long long)tm->tokens);
@@ -1337,7 +1340,9 @@ static void build_overview(ds4_tui *t) {
     /* The newest decode token and the newest prefill chunk describe the same
      * moment, so they share a row as soon as the pane fits two columns; each
      * block drops fields its column cannot show instead of wrapping one value
-     * onto its own line. */
+     * onto its own line. These rows name the record the live strips are showing
+     * at their right edge, so they repeat no timing: position and token are the
+     * only things a strip cannot tell you. */
     {
         const ds4_prof_record_meta *ld = latest_kind(t, DS4_PREC_DECODE_TOKEN);
         const ds4_prof_record_meta *lp = latest_kind(t, DS4_PREC_PREFILL_CHUNK);
@@ -1345,45 +1350,34 @@ static void build_overview(ds4_tui *t) {
         tui_block *bd = block_alloc(t, 2, 34, 0);
         tui_block *bp = block_alloc(t, 2, 34, 1);
         if (ld) {
-            if (bd->w >= 52)
-                doc_line(&bd->doc, ST_NORMAL,
-                         " latest D #%llu %.2f ms %.0f t/s pos %d tok %u",
-                         (unsigned long long)ld->seq, ld->ms,
-                         ld->ms > 0 ? 1000.0 / ld->ms : 0, ld->pos,
+            if (bd->w >= 34)
+                doc_line(&bd->doc, ST_NORMAL, " newest D #%llu  pos %d  tok %u",
+                         (unsigned long long)ld->seq, ld->pos,
                          ld->token == UINT32_MAX ? 0 : ld->token);
-            else if (bd->w >= 34)
-                doc_line(&bd->doc, ST_NORMAL, " latest D #%llu %.2f ms %.0f t/s",
-                         (unsigned long long)ld->seq, ld->ms,
-                         ld->ms > 0 ? 1000.0 / ld->ms : 0);
             else
-                doc_line(&bd->doc, ST_NORMAL, " latest D #%llu %.2f ms",
-                         (unsigned long long)ld->seq, ld->ms);
+                doc_line(&bd->doc, ST_NORMAL, " newest D #%llu  pos %d",
+                         (unsigned long long)ld->seq, ld->pos);
         } else {
-            doc_line(&bd->doc, ST_GRAY, " latest D none yet");
+            doc_line(&bd->doc, ST_GRAY, " newest D none yet");
         }
         if (lp) {
-            const double per = lp->n_tokens ? lp->ms / (double)lp->n_tokens : lp->ms;
-            if (bp->w >= 52)
-                doc_line(&bp->doc, ST_NORMAL,
-                         " latest P #%llu %u tok %.2f ms %.2f ms/t %.2f t/s",
-                         (unsigned long long)lp->seq, lp->n_tokens, lp->ms, per,
-                         per > 0 ? 1000.0 / per : 0);
-            else if (bp->w >= 34)
-                doc_line(&bp->doc, ST_NORMAL, " latest P #%llu %u tok %.2f ms/t",
-                         (unsigned long long)lp->seq, lp->n_tokens, per);
+            if (bp->w >= 34)
+                doc_line(&bp->doc, ST_NORMAL, " newest P #%llu  %u tok  pos %d",
+                         (unsigned long long)lp->seq, lp->n_tokens, lp->pos);
             else
-                doc_line(&bp->doc, ST_NORMAL, " latest P #%llu %.2f ms",
-                         (unsigned long long)lp->seq, lp->ms);
+                doc_line(&bp->doc, ST_NORMAL, " newest P #%llu  %u tok",
+                         (unsigned long long)lp->seq, lp->n_tokens);
         } else {
-            doc_line(&bp->doc, ST_GRAY, " latest P none yet");
+            doc_line(&bp->doc, ST_GRAY, " newest P none yet");
         }
         doc_blocks(t, d, 2, 34);
     }
 
-    /* Averages: what one token costs, and how much of that the named stages
-     * explain. Kept out of the per-stage rows so the two are never read as the
-     * same number, and one block per kind so decode and prefill cannot be
-     * confused. */
+    /* Averages: how long one token or chunk really took (wall) against the sum
+     * of every stage the engine measured. The second exceeds the first because
+     * device, transfer and wait rows run concurrently with compute, so the two
+     * are different quantities and each is printed once, named by what it is.
+     * One block per kind, so decode and prefill are never averaged together. */
     doc_line(d, ST_TITLE, " Averages over all counted tokens");
     {
         double dsum = 0, psum = 0;
@@ -1395,10 +1389,10 @@ static void build_overview(ds4_tui *t) {
             pbytes += v->stages[i].kind[DS4_PREC_PREFILL_CHUNK].bytes;
         }
         const double dper = tm->tokens ? dsum / (double)tm->tokens : 0;
-        const double pper = tm->prefill_tokens ? psum / (double)tm->prefill_tokens : 0;
         const double wall = ds4_prof_avg(&tm->per_token_ms);
         const double pwall = tm->prefill_ms.n
             ? tm->prefill_ms.sum / (double)tm->prefill_ms.n : 0;
+        const double pchunk = tm->prefill_ms.n ? psum / (double)tm->prefill_ms.n : 0;
         char bdt[24], bpt[24];
         ds4_profiler_format_bytes(bdt, sizeof(bdt),
             tm->tokens ? dbytes / tm->tokens : 0);
@@ -1408,24 +1402,19 @@ static void build_overview(ds4_tui *t) {
         tui_block *bp = block_alloc(t, 2, 52, 1);
         tui_doc *dd = &bd->doc, *dp = &bp->doc;
         doc_line(dd, ST_CYAN, " decode");
-        /* Named work is per-device wall clock and decode overlaps the two GPUs,
-         * so it can exceed the token wall; a negative residual would read as a
-         * bug, so say what it is instead. */
-        if (dper <= wall)
-            doc_line(dd, ST_NORMAL, "   wall %.2f ms/token  named %.2f ms (%.1f%%)",
-                     wall, dper, wall > 0 ? 100.0 * dper / wall : 0);
-        else
-            doc_line(dd, ST_NORMAL,
-                     "   wall %.2f ms/token  named %.2f ms (%.1f%%, overlap)",
-                     wall, dper, wall > 0 ? 100.0 * dper / wall : 0);
-        doc_line(dd, ST_NORMAL, "   %s/token moved, %llu tokens counted",
-                 bdt, (unsigned long long)tm->tokens);
+        doc_line(dd, ST_NORMAL, "   wall %.2f ms/token", wall);
+        doc_line(dd, ST_NORMAL, "   stage sum %.2f ms (%.0f%% of wall)",
+                 dper, wall > 0 ? 100.0 * dper / wall : 0);
+        doc_line(dd, ST_GRAY, "   %s/token moved", bdt);
+        doc_line(dd, ST_GRAY, "   %llu tokens counted",
+                 (unsigned long long)tm->tokens);
         doc_line(dp, ST_CYAN, " prefill");
         if (tm->prefill_tokens) {
-            doc_line(dp, ST_NORMAL, "   wall %.2f ms/chunk  named %.2f ms/chunk",
-                     pwall, psum / (double)(tm->prefill_ms.n ? tm->prefill_ms.n : 1));
-            doc_line(dp, ST_NORMAL, "   %.2f ms/token  %s/token moved", pper, bpt);
-            doc_line(dp, ST_NORMAL, "   %llu tokens in %llu chunks",
+            doc_line(dp, ST_NORMAL, "   wall %.2f ms/chunk", pwall);
+            doc_line(dp, ST_NORMAL, "   stage sum %.2f ms/chunk (%.0f%% of wall)",
+                     pchunk, pwall > 0 ? 100.0 * pchunk / pwall : 0);
+            doc_line(dp, ST_GRAY, "   %s/token moved", bpt);
+            doc_line(dp, ST_GRAY, "   %llu tokens in %llu chunks",
                      (unsigned long long)tm->prefill_tokens,
                      (unsigned long long)tm->prefill_ms.n);
         } else {
@@ -1437,7 +1426,10 @@ static void build_overview(ds4_tui *t) {
     /* Live strips come before the per-stage table: these are what changes every
      * tick, and the table below them is long enough to push them off the pane.
      * One block per series, so a wide pane shows several strips per row and
-     * each strip shows as much history as its column holds. */
+     * each strip shows as much history as its column holds. A strip carries
+     * "now" at its right edge, which is the only place the newest instantaneous
+     * rate and latency appear; the title stays short because a long one wraps
+     * the pane it was meant to label. */
     doc_line(d, ST_TITLE, " Live history");
     {
         const int nb = 3 + v->dev_n;
@@ -1482,8 +1474,8 @@ static void build_overview(ds4_tui *t) {
      * with two different values. Every stage the engine measured is printed
      * under its category, gpu steps and transfers included, so the rows of a
      * column add up to its total row and the shares to 100%: the gpu, transfer
-     * and wait rows overlap the compute rows, so the total is named work, not
-     * the token wall. */
+     * and wait rows overlap the compute rows, so the column total is the sum of
+     * measured stage time, not the wall time of the token. */
     doc_line(d, ST_TITLE, " Cost per token by stage");
     {
         double sums[2] = {0, 0};
@@ -1599,14 +1591,24 @@ static void build_overview(ds4_tui *t) {
                  (unsigned long long)total, (unsigned long long)gpu_exp,
                  (unsigned long long)ram_exp, (unsigned long long)ssd);
         if (st->host_arena_capacity_bytes) {
-            char ba[24], bc[24];
-            ds4_profiler_format_bytes(ba, sizeof(ba), st->host_arena_used_bytes);
+            /* Pinned memory cannot be reclaimed, so the pin is sized once up
+             * front and filled lazily: "reserved" and "filled" are different
+             * numbers and printing them as used/of-allocated made the pin look
+             * like a short allocation. */
+            char bu[24], bc[24];
+            ds4_profiler_format_bytes(bu, sizeof(bu), st->host_arena_used_bytes);
             ds4_profiler_format_bytes(bc, sizeof(bc), st->host_arena_capacity_bytes);
-            doc_line(&br->doc, ST_NORMAL, "  pinned host arena %s/%s", ba, bc);
-            doc_line(&br->doc, ST_GRAY, "  hits %llu  misses %llu  evictions %llu",
+            const double pct = st->host_arena_capacity_bytes
+                ? 100.0 * (double)st->host_arena_used_bytes /
+                      (double)st->host_arena_capacity_bytes : 0;
+            doc_line(&br->doc, ST_NORMAL, "  pinned host arena %s reserved", bc);
+            doc_line(&br->doc, ST_NORMAL, "  filled %s (%.0f%%), %llu experts",
+                     bu, pct, (unsigned long long)st->host_arena_experts);
+            doc_line(&br->doc, ST_GRAY,
+                     "  hits %llu  misses %llu  admissions %llu",
                      (unsigned long long)st->host_arena_hits,
                      (unsigned long long)st->host_arena_misses,
-                     (unsigned long long)st->host_arena_evictions);
+                     (unsigned long long)st->host_arena_admissions);
         }
         doc_line(&bd->doc, ST_TITLE, " Devices and storage (live)");
         for (int i = 0; i < v->dev_n; i++) {
@@ -1838,14 +1840,14 @@ static void build_detail(ds4_tui *t) {
         uint64_t sum = 0;
         for (uint32_t i = 0; i < r.stage_n; i++) sum += r.stages[i].total_ns;
         const double wall = r.ms;
-        const double named = (double)sum / 1e6;
-        if (wall >= named)
+        const double stages = (double)sum / 1e6;
+        if (wall >= stages)
             doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; named stages %.3f ms; residual %.3f ms",
-                     wall, named, wall - named);
+                     "  wall %.3f ms; stage sum %.3f ms; unmeasured %.3f ms",
+                     wall, stages, wall - stages);
         else
             doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; named stages %.3f ms", wall, named);
+                     "  wall %.3f ms; stage sum %.3f ms (rows overlap)", wall, stages);
     }
 
     /* Device state and link traffic are two short tables about the same record,
@@ -2027,8 +2029,8 @@ static void build_experts(ds4_tui *t) {
         char bu[24], bc[24];
         ds4_profiler_format_bytes(bu, sizeof(bu), st->host_arena_used_bytes);
         ds4_profiler_format_bytes(bc, sizeof(bc), st->host_arena_capacity_bytes);
-        doc_line(dr, ST_NORMAL, "  host arena used %s/%s  experts %llu",
-                 bu, bc, (unsigned long long)st->host_arena_experts);
+        doc_line(dr, ST_NORMAL, "  host arena %s reserved, %s filled  %llu experts",
+                 bc, bu, (unsigned long long)st->host_arena_experts);
         doc_line(dr, ST_GRAY, "  hits %llu  misses %llu  admissions %llu  evictions %llu",
                  (unsigned long long)st->host_arena_hits,
                  (unsigned long long)st->host_arena_misses,
@@ -2129,16 +2131,23 @@ static void build_help(ds4_tui *t) {
                  "pinned host arena in RAM, or the SSD. Routing lists, for the "
                  "selected token, where each expert was read from and where it "
                  "ran. Arena hits were served from RAM, admissions are misses "
-                 "that took an empty slot, evictions reclaim a slot when full.");
+                 "that took an empty slot, evictions reclaim a slot when full. "
+                 "The pin is reserved once at start-up and filled from the preload "
+                 "and from live misses, so a partly filled arena over free slots is "
+                 "a session that left them unused, not a fill that stopped.");
         break;
     default:
         para_put(d, ST_GRAY,
-                 "D/P are averages since the last reset (r); ms/token is the whole "
-                 "decode record, so that is the latency that matters. Cost rows are "
-                 "per-device wall clock, and the gpu, transfer and wait rows overlap "
-                 "the compute rows, so a column adds up to named work rather than to "
-                 "the wall and each share is of its own kind's total. Capture (p) "
-                 "serialises the GPU, so tok/s reads low while it is on.");
+                 "D/P are average rates since the last reset (r). The decode and "
+                 "prefill blocks give each kind's wall time, the real elapsed time "
+                 "of one token or chunk, and the stage sum, the total of every "
+                 "measured stage. The stage sum can exceed the wall because the GPU, "
+                 "transfer and wait rows run at the same time as the compute rows, "
+                 "so it measures work done, not time waited; every share below is "
+                 "of its own kind's stage sum, and a column never adds up to the "
+                 "wall. A live strip is one series ending at the newest token, "
+                 "and the number beside its label is that newest value. Capture "
+                 "(p) serialises the GPU, so rates read low while it is on.");
         break;
     }
     doc_line(d, ST_NORMAL, "");

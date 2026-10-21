@@ -34066,11 +34066,15 @@ static bool metal_graph_seed_host_expert_arena(
     }
     ds4_gpu_host_arena_stats_t arena;
     ds4_gpu_host_arena_stats(&arena);
+    /* Pin size and fill, not intent: the budget floors to whole slots, so the
+     * pinned bytes are usually a little under what was asked for, and printing
+     * what was seeded (not what was planned) is what makes a shortfall visible. */
     fprintf(stderr,
-            "ds4: host expert arena: budget %.2f GiB, preloaded %.2f GiB "
-            "(%u experts in %.3f s), fill from live reads: %s\n",
+            "ds4: host expert arena: pinned %.2f GiB (budget %.2f GiB), "
+            "preloaded %.2f GiB (%u experts in %.3f s), fill from live reads: %s\n",
+            (double)arena.capacity_bytes / 1073741824.0,
             (double)budget / 1073741824.0,
-            (double)fill / 1073741824.0,
+            (double)arena.used_bytes / 1073741824.0,
             arena.experts,
             now_sec() - t0,
             admit ? "on" : "off");

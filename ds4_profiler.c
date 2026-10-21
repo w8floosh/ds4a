@@ -2408,9 +2408,13 @@ size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit) {
         ds4_profiler_format_bytes(c1, sizeof(c1), v.stats.host_arena_capacity_bytes);
         ds4_profiler_format_bytes(c2, sizeof(c2), v.stats.host_expert_bytes);
         const uint64_t look = v.stats.host_arena_hits + v.stats.host_arena_misses;
-        jfmt(&o, "  expert arena: %s of %s (%.1f%%), %llu experts of %llu "
-                 "(%s each, %.1f%% of the model's routed experts)\n",
-             c0, c1,
+        /* Pinned memory cannot be reclaimed, so the pin is sized once and
+         * filled lazily: "reserved" is the cudaMallocHost size, "filled" is
+         * what admissions and the preload actually put in it. Printing used
+         * "of" capacity read as a short allocation, so name both numbers. */
+        jfmt(&o, "  pinned host arena: %s reserved, %s filled (%.1f%%), "
+                 "%llu experts of %llu (%s each, %.1f%% of routed experts)\n",
+             c1, c0,
              v.stats.host_arena_capacity_bytes
                  ? 100.0 * (double)v.stats.host_arena_used_bytes /
                        (double)v.stats.host_arena_capacity_bytes : 0.0,
@@ -2427,13 +2431,19 @@ size_t ds4_profiler_report(char *buf, size_t buflen, int kind, int limit) {
              (unsigned long long)v.stats.host_arena_admissions,
              (unsigned long long)v.stats.host_arena_evictions,
              (unsigned long long)v.stats.host_arena_evicted_fetches);
-        jfmt(&o, "  arena headroom left: %llu experts (%s)\n",
-             (unsigned long long)(v.stats.host_arena_capacity_bytes >
-                                          v.stats.host_arena_used_bytes
-                 ? (v.stats.host_arena_capacity_bytes - v.stats.host_arena_used_bytes) /
-                       (v.stats.host_expert_bytes ? v.stats.host_expert_bytes : 1)
-                 : 0),
-             c1);
+        /* Free slots stay free until a fetch misses the pool and the arena at
+         * once, which is rare on a session the preload already covers. Say so
+         * here, or the unused rest of the pin looks like a fill that stopped. */
+        const uint64_t free_bytes =
+            v.stats.host_arena_capacity_bytes > v.stats.host_arena_used_bytes
+                ? v.stats.host_arena_capacity_bytes - v.stats.host_arena_used_bytes
+                : 0;
+        ds4_profiler_format_bytes(c2, sizeof(c2), free_bytes);
+        jfmt(&o, "  arena free slots: %llu experts (%s), filled only when a "
+                 "fetch misses both the pool and the arena\n",
+             (unsigned long long)(free_bytes /
+                 (v.stats.host_expert_bytes ? v.stats.host_expert_bytes : 1)),
+             c2);
     } else {
         jraw(&o, "  expert arena: not configured\n");
     }
