@@ -629,6 +629,30 @@ static void screen_printf(screen *s, int row, int col, uint8_t style,
     screen_puts(s, row, col, style, tmp, (size_t)n);
 }
 
+/* Write one whole frame. A frame must reach the terminal in full: the cell
+ * diff afterwards trusts prev, so a half written frame would strand every row
+ * behind the break until something happened to change it again (that is what
+ * made panes look half painted until they were focused). EINTR is retried
+ * outright; a non-blocking or backed up terminal gets a short wait instead of
+ * a dropped frame. */
+static int screen_write_all(const char *data, size_t len) {
+    size_t off = 0;
+    int waits = 0;
+    while (off < len) {
+        ssize_t n = write(STDOUT_FILENO, data + off, len - off);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && waits < 50) {
+            struct pollfd p = { STDOUT_FILENO, POLLOUT, 0 };
+            waits++;
+            (void)poll(&p, 1, 10);
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
 /* Paint the cells that differ from what the terminal already shows. Rows are
  * diffed cell by cell and each row is written from its first to its last
  * changed column, so a streaming token costs a few bytes at the end of one
@@ -639,29 +663,27 @@ static void screen_flush(screen *s, int cur_row, int cur_col, int show_cursor) {
     sbuf out;
     memset(&out, 0, sizeof(out));
     if (s->sync) sb_puts(&out, "\x1b[?2026h");   /* begin synchronized update */
+    const size_t cells = (size_t)s->rows * (size_t)s->cols;
+    /* A resize leaves reflowed rows no diff can reconcile, so the frame that
+     * follows one homes and clears instead of trusting prev. */
     int full = s->force_clear || !s->prev ||
                s->prev_rows != s->rows || s->prev_cols != s->cols;
     if (full) {
         if (!s->prev || s->prev_rows != s->rows || s->prev_cols != s->cols) {
             screen_drop_prev(s);
-            s->prev = calloc((size_t)s->rows * (size_t)s->cols, sizeof(*s->prev));
+            s->prev = calloc(cells, sizeof(*s->prev));
             s->prev_rows = s->rows;
             s->prev_cols = s->cols;
         }
-        if (s->prev)
-            memset(s->prev, 0xFF, (size_t)s->rows * (size_t)s->cols * sizeof(*s->prev));
-        /* Home the cursor and clear once: a resize leaves the terminal with
-         * reflowed rows that no diff can reconcile. */
+        if (!s->prev) { free(out.s); return; }
         sb_puts(&out, "\x1b[0m\x1b[2J\x1b[H");
-        s->force_clear = 0;
     }
-    if (!s->prev) { free(out.s); return; }
     for (int r = 0; r < s->rows; r++) {
         const screen_cell *cur = s->cells + (size_t)r * s->cols;
-        screen_cell *old = s->prev + (size_t)r * s->cols;
+        const screen_cell *old = s->prev + (size_t)r * s->cols;
         int first = -1, last = -1;
         for (int c = 0; c < s->cols; c++) {
-            if (cur[c].cp != old[c].cp || cur[c].style != old[c].style ||
+            if (full || cur[c].cp != old[c].cp || cur[c].style != old[c].style ||
                 cur[c].cont != old[c].cont) {
                 if (first < 0) first = c;
                 last = c;
@@ -690,18 +712,17 @@ static void screen_flush(screen *s, int cur_row, int cur_col, int show_cursor) {
             utf8_encode(cell->cp ? cell->cp : ' ', enc);
             sb_puts(&out, enc);
         }
-        memcpy(old, cur, (size_t)s->cols * sizeof(*old));
     }
     if (show_cursor && cur_row > 0 && cur_col > 0)
         sb_printf(&out, "\x1b[%d;%dH\x1b[?25h", cur_row, cur_col);
     else
         sb_puts(&out, "\x1b[?25l");
     if (s->sync) sb_puts(&out, "\x1b[?2026l");
-    size_t off = 0;
-    while (off < out.len) {
-        ssize_t n = write(STDOUT_FILENO, out.s + off, out.len - off);
-        if (n <= 0) break;
-        off += (size_t)n;
+    /* Commit prev only for a frame the terminal actually took: a dropped one
+     * keeps its cells marked dirty, so the next flush replays them whole. */
+    if (screen_write_all(out.s, out.len)) {
+        memcpy(s->prev, s->cells, cells * sizeof(*s->prev));
+        s->force_clear = 0;
     }
     free(out.s);
 }
