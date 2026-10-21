@@ -74,6 +74,7 @@ __pycache__/
 .DS_Store
 /tests/test_cpu_dot
 /tests/test_tui
+/tests/test_timeline
 /trace.jsonl
 /cufile.log
 /tests/test_prompt_prefix

@@ -932,7 +932,6 @@ static int cuda_pread_pool_run(cuda_pread_job *jobs, int n) {
     pthread_mutex_unlock(&pool->mutex);
     const uint64_t read_dt = prof_now_ns() - read_t0;
     g_prof_host_read_ns += read_dt;
-    ds4_profiler_note_step(DS4_PSTEP_HOST_MOE_PREP, read_dt, 1, 0);
     uint64_t ssd_bytes = 0, arena_bytes = 0, ssd_jobs = 0, arena_jobs = 0;
     for (int i = 0; i < n; i++) {
         /* Arena jobs never touched storage, so they must not be charged to
@@ -946,10 +945,21 @@ static int cuda_pread_pool_run(cuda_pread_job *jobs, int n) {
             arena_jobs++;
         }
     }
+    /* One window, one charge. The wave is bounded by its slowest source, so a
+     * wave that contains any storage read is charged to the SSD row whole, and
+     * an arena load that rode along reports its bytes at zero wall: it was
+     * served while the storage read was in flight. Counting the same window on
+     * a host row as well made the stage table report those milliseconds twice
+     * and pushed the token's stage sum past its own wall. */
     if (ssd_jobs)
-        ds4_profiler_note_step(DS4_PSTEP_XFER_EXPERT_SSD, read_dt, ssd_jobs, ssd_bytes);
+        ds4_profiler_note_step_dev(DS4_PSTEP_XFER_EXPERT_SSD,
+                                   DS4_PROF_DEV_UNKNOWN, read_dt, ssd_jobs,
+                                   ssd_bytes);
     if (arena_jobs)
-        ds4_profiler_note_step(DS4_PSTEP_XFER_EXPERT_ARENA, 0, arena_jobs, arena_bytes);
+        ds4_profiler_note_step_dev(DS4_PSTEP_XFER_EXPERT_ARENA,
+                                   DS4_PROF_DEV_UNKNOWN,
+                                   ssd_jobs ? 0 : read_dt, arena_jobs,
+                                   arena_bytes);
     for (int i = 0; i < n; i++) {
         if (!jobs[i].ok) return 0;
     }
@@ -4269,7 +4279,8 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     if (ok) {
         prof_note_tx(d, bytes);
         prof_note_activation(d, bytes);
-        ds4_profiler_note_step(DS4_PSTEP_XFER_ACT_HOST, wdt, 1, bytes);
+        ds4_profiler_note_step_dev(DS4_PSTEP_XFER_ACT_HOST, (uint8_t)d, wdt, 1,
+                                   bytes);
     }
     return ok;
 }
@@ -4286,7 +4297,7 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
         const uint64_t rdt = prof_now_ns() - t0;
         g_prof_device_wait_ns += rdt;
         g_prof_readback_ns += rdt;
-        ds4_profiler_note_step(DS4_PSTEP_WAIT_READBACK, rdt, 1, 0);
+        ds4_profiler_note_step_dev(DS4_PSTEP_WAIT_READBACK, (uint8_t)d, rdt, 1, 0);
         /* The vocabulary readback is hundreds of KiB; activation,
          * partial and id readbacks are far smaller. Keeping them apart
          * avoids charging every 24-byte id read to the logits row. */
@@ -4527,7 +4538,9 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
     const uint64_t t0 = prof_now_ns();
     const int ok = ds4_gpu_tensor_copy_xdev_impl(dst, src, bytes, false);
     if (ok)
-        ds4_profiler_note_step(DS4_PSTEP_XFER_PEER, prof_now_ns() - t0, 1, bytes);
+        ds4_profiler_note_step_dev(DS4_PSTEP_XFER_PEER,
+                                   (uint8_t)ds4_tensor_device_idx(dst),
+                                   prof_now_ns() - t0, 1, bytes);
     return ok;
 }
 
@@ -4633,7 +4646,9 @@ extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
     const uint64_t t0 = prof_now_ns();
     const int ok = ds4_gpu_tensor_copy_xdev_default_impl(dst, src, bytes);
     if (ok)
-        ds4_profiler_note_step(DS4_PSTEP_XFER_PEER, prof_now_ns() - t0, 1, bytes);
+        ds4_profiler_note_step_dev(DS4_PSTEP_XFER_PEER,
+                                   (uint8_t)ds4_tensor_device_idx(dst),
+                                   prof_now_ns() - t0, 1, bytes);
     return ok;
 }
 
@@ -29909,7 +29924,7 @@ static int cuda_stream_selected_cache_begin_load(
         const uint64_t wdt = prof_now_ns() - w0;
         g_prof_device_wait_ns += wdt;
         g_prof_upload_wait_ns += wdt;
-        ds4_profiler_note_step(DS4_PSTEP_WAIT_UPLOAD, wdt, 1, 0);
+        ds4_profiler_note_step_dev(DS4_PSTEP_WAIT_UPLOAD, prof_dst, wdt, 1, 0);
         for (size_t t = 0; t < table_ids.size(); t++) {
             if (pool_slot[t] >= 0) continue;
             ds4_profiler_trace_event(

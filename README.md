@@ -78,9 +78,13 @@ reads, so this fork adds:
   hotkey. `Ctrl-Y` copies the focused pane to the terminal clipboard over OSC 52
   (`set-clipboard on` in tmux); `Y` in the profiler copies the whole visible view
   instead of the window, so every record page and the full detail of the open
-  token come along. The chat line accepts bracketed pastes as one paste instead
-  of a burst of keys. `--profile-dump FILE|-` writes the same numbers as text when
-  the run ends, so a scripted run can be measured without a terminal.
+  token come along. The detail page draws a Gantt-style timeline of the open
+  token: CPU launch, device, bytes-in-flight and blocked-wait lanes on one
+  millisecond axis, with `t` to see it full width. The chat line accepts
+  bracketed pastes as one paste instead of a burst of keys.
+  `--profile-dump FILE|-` writes the same numbers as text when the run ends, so
+  a scripted run can be measured without a terminal; add `--profile-capture` to
+  carry each record's ordered events into that dump.
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
 * **Host-side expert page-cache budget.** Hot experts stay in the OS page cache
@@ -290,6 +294,15 @@ older records, `u` reloads it, `p` toggles stage capture and `r` resets
 aggregates. The help pane explains whichever profiler view is visible and lists
 the keys. The list is frozen while decoding so it cannot slide under the
 reader; new records are counted and appear on `u` or when decoding stops.
+The detail page of a token or prefill chunk opens with a timeline: one row
+per lane — CPU launch, each device, bytes in flight, host blocked — on the
+record's own millisecond axis, so overlapping work is visible as rows filled at
+the same column. Shading is the lane's duty in that column, and each lane drops
+the time a more specific lane already covers, so a read that blocked the CPU is
+counted once. `t` opens the timeline full width (with `+`/`-` zoom and
+Left/Right panning, since a 2 µs launch is invisible in a whole-token view), and
+`Ctrl-Y` copies it.
+
 `Ctrl-B` enables breakpoint mode: the engine pauses after each token or prefill
 chunk so the profiler can be inspected; `Space` continues, `b` disables and
 continues, `Ctrl-C` cancels generation. `--no-tui` keeps the classic line

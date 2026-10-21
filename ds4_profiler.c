@@ -106,9 +106,6 @@ static const struct {
     [DS4_PSTEP_HOST_SHARED]       = {"host_shared", "Shared expert dispatch",
         "CPU work to launch the dense expert every token uses, on top of the 6 routed ones.",
         "host"},
-    [DS4_PSTEP_HOST_MOE_PREP]     = {"host_moe_prep", "Routed expert staging (CPU)",
-        "Choosing expert weights to fetch and pointing the copy at them. Disk/RAM reads themselves are transfer rows.",
-        "host"},
     [DS4_PSTEP_HOST_TIER_DISPATCH] = {"host_tier", "Second-GPU dispatch (CPU)",
         "CPU work to hand the experts resident on the 3060 to that card. Does not include waiting for it.",
         "host"},
@@ -527,7 +524,7 @@ static void current_rec_note_expert_locked(void) {
 
 static void stage_note_ex(const char *part, const char *name,
                           const char *label, const char *hint,
-                          const char *category, uint32_t layer,
+                          const char *category, uint8_t device, uint32_t layer,
                           uint64_t total_ns, uint64_t encode_ns,
                           uint64_t wait_ns, uint64_t bytes);
 
@@ -684,7 +681,7 @@ static int stage_intern_locked(const char *part, const char *name,
 
 static void event_add_locked(uint16_t kind, uint16_t stage, uint16_t layer,
                              uint16_t expert, uint8_t device, uint32_t bytes,
-                             uint32_t dur_ns) {
+                             uint32_t dur_ns, uint32_t enc_ns) {
     const uint64_t now = monotonic_ns();
     ds4_prof_event *e = &g_events[g_event_next_seq % DS4_PEV_RING];
     memset(e, 0, sizeof(*e));
@@ -693,6 +690,7 @@ static void event_add_locked(uint16_t kind, uint16_t stage, uint16_t layer,
     e->t_us = (g_cur.open && now >= g_cur.start_ns)
         ? (uint32_t)((now - g_cur.start_ns) / 1000ull) : 0;
     e->dur_ns = dur_ns;
+    e->enc_ns = enc_ns;
     e->kind = kind;
     e->stage = stage;
     e->layer = layer;
@@ -707,7 +705,7 @@ static void event_add_locked(uint16_t kind, uint16_t stage, uint16_t layer,
 
 static void stage_note_ex(const char *part, const char *name,
                           const char *label, const char *hint,
-                          const char *category, uint32_t layer,
+                          const char *category, uint8_t device, uint32_t layer,
                           uint64_t total_ns, uint64_t encode_ns,
                           uint64_t wait_ns, uint64_t bytes) {
     if (!g_stage_capture) return;
@@ -758,21 +756,34 @@ static void stage_note_ex(const char *part, const char *name,
             u->count++;
             u->bytes += bytes;
         }
-        event_add_locked(DS4_PEV_STAGE, (uint16_t)id, (uint16_t)layer, 0, 0,
-                         (uint32_t)bytes, (uint32_t)(total_ns > UINT32_MAX
-                             ? UINT32_MAX : total_ns));
+        /* The event keeps the split: the timeline draws the CPU launch and the
+         * device part as two spans, which is where the overlap lives. */
+        event_add_locked(DS4_PEV_STAGE, (uint16_t)id, (uint16_t)layer, 0,
+                         device, (uint32_t)bytes,
+                         (uint32_t)(total_ns > UINT32_MAX ? UINT32_MAX : total_ns),
+                         (uint32_t)(encode_ns > UINT32_MAX ? UINT32_MAX : encode_ns));
     }
     UNLOCK();
+}
+
+void ds4_profiler_note_stage_dev(const char *part, const char *name,
+                                 uint8_t device, uint32_t layer, uint32_t pos,
+                                 uint32_t n_tokens, uint64_t total_ns,
+                                 uint64_t encode_ns, uint64_t wait_ns,
+                                 uint64_t bytes) {
+    (void)pos;
+    (void)n_tokens;
+    stage_note_ex(part ? part : "stage", name ? name : "unnamed",
+                  NULL, NULL, NULL, device, layer, total_ns, encode_ns,
+                  wait_ns, bytes);
 }
 
 void ds4_profiler_note_stage(const char *part, const char *name,
                              uint32_t layer, uint32_t pos, uint32_t n_tokens,
                              uint64_t total_ns, uint64_t encode_ns,
                              uint64_t wait_ns, uint64_t bytes) {
-    (void)pos;
-    (void)n_tokens;
-    stage_note_ex(part ? part : "stage", name ? name : "unnamed",
-                  NULL, NULL, NULL, layer, total_ns, encode_ns, wait_ns, bytes);
+    ds4_profiler_note_stage_dev(part, name, DS4_PROF_DEV_UNKNOWN, layer, pos,
+                                n_tokens, total_ns, encode_ns, wait_ns, bytes);
 }
 
 void ds4_profiler_set_stage_capture(int on) { g_stage_capture = on ? 1 : 0; }
@@ -783,7 +794,7 @@ void ds4_profiler_trace_event(uint16_t kind, uint16_t layer, uint16_t expert,
     if (!g_stage_capture && !g_record_enabled && !ds4_profiler_trace_enabled())
         return;
     LOCK();
-    event_add_locked(kind, 0, layer, expert, device, bytes, 0);
+    event_add_locked(kind, 0, layer, expert, device, bytes, 0, 0);
     UNLOCK();
 }
 
@@ -1082,8 +1093,8 @@ int ds4_profiler_record_experts(uint64_t seq, ds4_prof_expert_trace *out, int ma
     return n;
 }
 
-void ds4_profiler_note_step(ds4_prof_step step, uint64_t ns,
-                            uint64_t count, uint64_t bytes) {
+void ds4_profiler_note_step_dev(ds4_prof_step step, uint8_t device, uint64_t ns,
+                                uint64_t count, uint64_t bytes) {
     if ((unsigned)step >= (unsigned)DS4_PSTEP_COUNT) return;
     const uint64_t self_t0 = monotonic_ns();
     LOCK();
@@ -1097,10 +1108,15 @@ void ds4_profiler_note_step(ds4_prof_step step, uint64_t ns,
         const uint64_t wait = enc == 0 ? ns : 0;
         stage_note_ex(cat, ds4_profiler_step_id(step),
                       ds4_profiler_step_label(step),
-                      ds4_profiler_step_hint(step), cat, 0,
+                      ds4_profiler_step_hint(step), cat, device, 0,
                       ns, enc, wait, bytes);
     }
     prof_self_add(monotonic_ns() - self_t0);
+}
+
+void ds4_profiler_note_step(ds4_prof_step step, uint64_t ns,
+                            uint64_t count, uint64_t bytes) {
+    ds4_profiler_note_step_dev(step, DS4_PROF_DEV_UNKNOWN, ns, count, bytes);
 }
 
 void ds4_profiler_step_snapshot(ds4_prof_step_stat *out, int n) {
@@ -1687,12 +1703,21 @@ size_t ds4_profiler_record_dump(uint64_t seq, char *buf, size_t buflen) {
 
     /* Events, in order: what happened between the boundaries. */
     if (n_ev > 0) {
-        jraw(&o, "  events (t_us, kind, layer, expert, device, bytes, dur_us):\n");
+        jraw(&o, "  events (t_us=end, kind, layer, expert, device, bytes, dur_us,"
+                  " stage, launch_us):\n");
         for (int i = 0; i < n_ev; i++) {
             const ds4_prof_event *e = &ev[i];
-            jfmt(&o, "  %9u  %-14s L%-3u e%-4u d%-2u %10u %8.1f\n",
+            /* A stage row is one window with two owners: the CPU launch and
+             * the body it waits for. Printing both is what lets a reader (or
+             * the timeline) place them without guessing. */
+            char stage[48] = "", cat[16] = "";
+            if (e->kind == DS4_PEV_STAGE)
+                dump_stage_meta(e->stage, stage, sizeof(stage), NULL, 0,
+                                cat, sizeof(cat));
+            jfmt(&o, "  %9u  %-14s L%-3u e%-4u d%-2u %10u %8.1f  %-24s %8.1f\n",
                  e->t_us, ds4_profiler_event_kind(e->kind), e->layer, e->expert,
-                 e->device, e->bytes, (double)e->dur_ns / 1000.0);
+                 e->device, e->bytes, (double)e->dur_ns / 1000.0, stage,
+                 (double)e->enc_ns / 1000.0);
         }
     }
     free(ev);

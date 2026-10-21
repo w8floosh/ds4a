@@ -121,6 +121,7 @@ static volatile sig_atomic_t cli_dist_notice_printed;
 static const char *cli_profile_dump_path;
 static int cli_profile_dump_kind = -1;     /* DS4_PREC_*, -1 = every kind */
 static int cli_profile_dump_records = 8;
+static int cli_profile_capture;            /* --profile-capture */
 static ds4_tui *g_tui;
 
 static bool cli_interrupt_requested(void);
@@ -2319,6 +2320,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--profile-dump")) {
             cli_profile_dump_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--profile-capture")) {
+            cli_profile_capture = 1;
         } else if (!strcmp(arg, "--profile-records")) {
             cli_profile_dump_records = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (cli_profile_dump_records < 0) {
@@ -2685,6 +2688,12 @@ int main(int argc, char **argv) {
      * other place that turns them on) is what drives the engine. */
     if (cli_profile_dump_path || getenv("DS4_PROFILE_TRACE"))
         ds4_profiler_set_record_enabled(1);
+    /* Stage capture is what puts an ordered event list inside a record, and it
+     * costs a device sync per boundary, so it is opt-in outside the TUI: a dump
+     * asked for as a trace wants it, a dump asked for as numbers alone does
+     * not. */
+    if (cli_profile_capture)
+        ds4_profiler_set_stage_capture(1);
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,

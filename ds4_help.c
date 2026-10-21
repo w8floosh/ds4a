@@ -183,6 +183,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--tui", "Interactive terminal UI: chat and profiler side by side, messages below. On by default when both ends are terminals.");
     opt(fp, c, "--no-tui", "Use the classic line REPL instead of the terminal UI.");
     opt(fp, c, "--profile-dump FILE|-", "Write a profiler report when the run ends: decode/prefill rates, token time split, devices, expert-arena reservation and fill, per-kind stage tables, then the newest records with every stage, device and expert use in full detail. - writes it to stdout.");
+    opt(fp, c, "--profile-capture", "Record every stage boundary inside each profiler record, so the dump carries the ordered events and the token timeline can be rebuilt offline. Costs a device sync per boundary, which slows generation; the TUI turns it on itself with p.");
     opt(fp, c, "--profile-records N", "How many records --profile-dump details in full. Default: 8");
     opt(fp, c, "--profile-kind decode|prefill|all", "Which records --profile-dump details. Default: all");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");

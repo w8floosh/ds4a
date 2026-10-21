@@ -7,6 +7,7 @@
  */
 #include "ds4_tui.h"
 #include "ds4_profiler.h"
+#include "ds4_timeline.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -195,6 +196,19 @@ struct ds4_tui {
     int page;
     uint64_t list_newest_seq;
     int new_count;
+
+    /* Token timeline: the open record's spans, split into lanes, plus what the
+     * neighbouring records say about work that crosses a record boundary. */
+    ds4_tl tl;
+    uint32_t tl_wall_us;
+    uint32_t tl_v0_us, tl_v_us;  /* the overlay's zoom window, 0 = whole token */
+    uint64_t tl_built_seq;       /* record the lanes were built from */
+    int tl_built_n;              /* its event count, so a reopen rebuilds */
+    char tl_note[220];
+    int detail_open_xfer;        /* spans still open when the record closed */
+    int tl_open;                 /* full-width overlay on screen            */
+    int tl_scroll;               /* first visible row of the overlay        */
+    tui_doc tl_doc;              /* the overlay's own document              */
 
     /* live history (nvtop-style) */
     double h_tps[TUI_HIST], h_ms[TUI_HIST];
@@ -1839,6 +1853,359 @@ static void build_tokens(ds4_tui *t) {
                  t->new_count);
 }
 
+/* ---------------------------------------------------------------- timeline -- */
+
+/* The lanes, in the order they are drawn: what the CPU did, what each device
+ * did, what was in flight, and what the host waited for. Two lanes filled at
+ * the same column is the overlap the reader came for. */
+static const struct {
+    int lane;
+    const char *name;
+    unsigned char style;
+} k_tl_lanes[] = {
+    { DS4_TL_HOST, "host", ST_CYAN },
+    { DS4_TL_DEV0, "gpu0", ST_GREEN },
+    { DS4_TL_DEV1, "gpu1", ST_MAGENTA },
+    { DS4_TL_XFER, "xfer", ST_YELLOW },
+    { DS4_TL_WAIT, "wait", ST_BLUE },
+};
+#define TUI_TL_LANES ((int)(sizeof(k_tl_lanes) / sizeof(k_tl_lanes[0])))
+
+static int tl_lane_for_category(const char *cat, uint8_t device) {
+    if (cat && !strcmp(cat, "wait")) return DS4_TL_WAIT;
+    if (cat && !strcmp(cat, "transfer")) return DS4_TL_XFER;
+    if (cat && !strcmp(cat, "host")) return DS4_TL_HOST;
+    return device == 1 ? DS4_TL_DEV1 : DS4_TL_DEV0;
+}
+
+/* Pair one START with the END that closes it: expert transfers are keyed by
+ * layer+expert, activation copies and compute scopes by device (they never
+ * nest more than one deep on a device). */
+typedef struct {
+    uint32_t t_us;
+    uint16_t layer, expert;
+    uint8_t used;
+} tl_pending;
+
+static void tl_pending_open(tl_pending *p, int n, uint32_t t_us,
+                            uint16_t layer, uint16_t expert) {
+    int slot = -1;
+    for (int i = 0; i < n && slot < 0; i++) if (!p[i].used) slot = i;
+    if (slot < 0) {                     /* full: retire the oldest start */
+        slot = 0;
+        for (int i = 1; i < n; i++) if (p[i].t_us < p[slot].t_us) slot = i;
+    }
+    p[slot].t_us = t_us;
+    p[slot].layer = layer;
+    p[slot].expert = expert;
+    p[slot].used = 1;
+}
+
+static int tl_pending_take(tl_pending *p, int n, uint16_t layer,
+                           uint16_t expert, int match) {
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (!p[i].used) continue;
+        if (match && (p[i].layer != layer || p[i].expert != expert)) continue;
+        if (best < 0 || p[i].t_us < p[best].t_us) best = i;
+    }
+    if (best < 0) return -1;
+    p[best].used = 0;
+    return (int)best;
+}
+
+/* Two records meet at their boundary, and a record's own events stop at its
+ * close. Say what that means here: how long the previous record had been idle,
+ * how long the next one waited, and whether anything of this record was still
+ * in flight when it closed. A decode token is a synchronous loop, so the
+ * honest expectation is a clean edge; a prefill chunk can hand work over. */
+static void timeline_note_neighbours(ds4_tui *t) {
+    char *out = t->tl_note;
+    size_t cap = sizeof(t->tl_note);
+    int w = 0;
+    const ds4_prof_record *r = &t->detail;
+    ds4_prof_record prev, next;
+    const int has_prev = r->seq > 0 && ds4_profiler_record_get(r->seq - 1, &prev);
+    const int has_next = ds4_profiler_record_get(r->seq + 1, &next);
+    w += snprintf(out + w, cap - (size_t)w,
+                  " boundary: this record runs %.1f ms; ",
+                  r->ms);
+    if (has_prev) {
+        const double gap = r->start_ns > prev.end_ns
+            ? (double)(r->start_ns - prev.end_ns) / 1e6
+            : -(double)(prev.end_ns - r->start_ns) / 1e6;
+        w += snprintf(out + w, cap - (size_t)w,
+                      "previous #%llu %s %.2f ms, ",
+                      (unsigned long long)prev.seq,
+                      gap >= 0 ? "closed" : "overran by", gap >= 0 ? gap : -gap);
+    } else {
+        w += snprintf(out + w, cap - (size_t)w, "no previous record, ");
+    }
+    if (has_next) {
+        const double gap = next.start_ns > r->end_ns
+            ? (double)(next.start_ns - r->end_ns) / 1e6
+            : -(double)(r->end_ns - next.start_ns) / 1e6;
+        w += snprintf(out + w, cap - (size_t)w,
+                      "next #%llu %s %.2f ms",
+                      (unsigned long long)next.seq,
+                      gap >= 0 ? "started" : "overlapped by",
+                      gap >= 0 ? gap : -gap);
+    } else {
+        w += snprintf(out + w, cap - (size_t)w, "no newer record yet");
+    }
+    if (w < (int)cap && t->detail_open_xfer > 0)
+        snprintf(out + w, cap - (size_t)w,
+                 "; %d transfer(s) were still in flight at the close",
+                 t->detail_open_xfer);
+}
+
+/* Turn the open record's events into lanes. A stage event carries both halves
+ * of its span: the CPU launch (enc_ns, host lane) and the body it waited for
+ * (device lane, transfer lane or wait lane, by category). Point events pair up
+ * into in-flight windows so a transfer that started before the compute it feeds
+ * shows as a bar under it instead of vanishing into a total. */
+static void timeline_build(ds4_tui *t) {
+    const ds4_prof_record *r = &t->detail;
+    const uint32_t wall_us = r->ms > 0 ? (uint32_t)(r->ms * 1000.0 + 0.5) : 0;
+    t->tl_wall_us = wall_us;
+    ds4_tl_init(&t->tl, wall_us);
+    t->detail_open_xfer = 0;
+    t->tl_note[0] = '\0';
+    if (!t->detail_ready) return;
+
+    tl_pending xfer[64], act[8], comp[8];
+    memset(xfer, 0, sizeof(xfer));
+    memset(act, 0, sizeof(act));
+    memset(comp, 0, sizeof(comp));
+
+    for (int i = 0; i < t->detail_event_n; i++) {
+        const ds4_prof_event *e = &t->detail_events[i];
+        switch (e->kind) {
+        case DS4_PEV_STAGE: {
+            const char *cat = "";
+            if (t->view && e->stage < (uint16_t)t->view->n_stages)
+                cat = t->view->stages[e->stage].category;
+            const uint32_t dur = (uint32_t)(e->dur_ns / 1000u);
+            uint32_t enc = (uint32_t)(e->enc_ns / 1000u);
+            if (enc > dur) enc = dur;
+            const uint32_t t1 = e->t_us;
+            const uint32_t t0 = t1 > dur ? t1 - dur : 0;
+            if (enc) ds4_tl_push(&t->tl, DS4_TL_HOST, t0, t0 + enc);
+            if (dur > enc) ds4_tl_push(&t->tl, tl_lane_for_category(cat, e->device),
+                                       t0 + enc, t1);
+            break;
+        }
+        case DS4_PEV_XFER_EXPERT_START:
+            tl_pending_open(xfer, 64, e->t_us, e->layer, e->expert);
+            break;
+        case DS4_PEV_XFER_EXPERT_END: {
+            const int slot = tl_pending_take(xfer, 64, e->layer, e->expert, 1);
+            if (slot >= 0) ds4_tl_push(&t->tl, DS4_TL_XFER,
+                                       xfer[slot].t_us, e->t_us);
+            break;
+        }
+        case DS4_PEV_XFER_ACT_START:
+            tl_pending_open(act, 8, e->t_us, e->device, 0);
+            break;
+        case DS4_PEV_XFER_ACT_END: {
+            const int slot = tl_pending_take(act, 8, 0, 0, 0);
+            if (slot >= 0 && act[slot].t_us != e->t_us)
+                ds4_tl_push(&t->tl, DS4_TL_XFER, act[slot].t_us, e->t_us);
+            break;
+        }
+        case DS4_PEV_COMPUTE_START:
+            tl_pending_open(comp, 8, e->t_us, e->device, 0);
+            break;
+        case DS4_PEV_COMPUTE_END: {
+            const int slot = tl_pending_take(comp, 8, 0, 0, 0);
+            if (slot >= 0) {
+                /* The scope brackets a launch, so it is CPU work by definition;
+                 * keep it in the device lane it will feed only when it lasts
+                 * long enough to matter next to the launch windows. */
+                ds4_tl_push(&t->tl, e->device == 1 ? DS4_TL_DEV1 : DS4_TL_DEV0,
+                            comp[slot].t_us, e->t_us);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    for (int i = 0; i < 64; i++) if (xfer[i].used) t->detail_open_xfer++;
+    for (int i = 0; i < 8; i++) {
+        if (act[i].used) t->detail_open_xfer++;
+        if (comp[i].used) t->detail_open_xfer++;
+    }
+    ds4_tl_normalize(&t->tl);
+    /* A stage's CPU window contains the read or sync that blocked it, and a
+     * device window contains the stream sync that ended it: the same instant
+     * seen by two measurements. Take the more specific one off the general one
+     * so a lane does not claim time another lane already explains. Transfers
+     * that run beside the compute stay in both, because that overlap is real. */
+    ds4_tl_carve(&t->tl, DS4_TL_HOST, DS4_TL_XFER);
+    ds4_tl_carve(&t->tl, DS4_TL_HOST, DS4_TL_WAIT);
+    /* A stage window already ends in the sync that closed it, so the sync's own
+     * row measures the same wall: it is dropped from the wait lane, not from
+     * the device lane, which is the side that says what the GPU was doing. */
+    ds4_tl_carve(&t->tl, DS4_TL_WAIT, DS4_TL_DEV0);
+    ds4_tl_carve(&t->tl, DS4_TL_WAIT, DS4_TL_DEV1);
+    ds4_tl_normalize(&t->tl);
+    timeline_note_neighbours(t);
+}
+
+/* A label row for the axis: tick times in milliseconds, placed under the
+ * columns they belong to. Wide panes get more ticks instead of longer labels. */
+static void tl_axis_row(uint32_t v0_us, uint32_t v_us, int cols, int wide,
+                        char *out) {
+    if (cols < 4) cols = 4;
+    memset(out, ' ', (size_t)cols);
+    out[cols] = '\0';
+    const int ticks = wide ? 9 : 5;
+    for (int k = 0; k < ticks; k++) {
+        const double f = (double)k / (double)(ticks - 1);
+        const uint32_t us = v0_us + (uint32_t)(f * (double)v_us + 0.5);
+        char lbl[16];
+        if (v_us >= 200000) snprintf(lbl, sizeof(lbl), "%.0f", (double)us / 1000.0);
+        else snprintf(lbl, sizeof(lbl), "%.1f", (double)us / 1000.0);
+        const int len = (int)strlen(lbl);
+        int at = (int)(f * (double)(cols - 1)) - len / 2;
+        if (at < 0) at = 0;
+        if (at + len > cols) at = cols - len;
+        if (at < 0) at = 0;
+        memcpy(out + at, lbl, (size_t)len);
+    }
+}
+
+static void timeline_render(ds4_tui *t, tui_doc *d, int width, int wide) {
+    const int labelw = 6;
+    const int suffix = 13;          /* "  999.9ms all" */
+    int cols = width - labelw - suffix;
+    if (cols < 8) cols = 8;
+    if (cols > 500) cols = 500;
+    char bar[512], axis[512];
+    const uint32_t wall_us = t->tl_wall_us;
+
+    if (t->detail_event_n == 0) {
+        doc_line(d, ST_YELLOW,
+                 " no events for this record: the timeline needs stage capture"
+                 " (p) on while it ran");
+        return;
+    }
+    if (wall_us == 0) {
+        doc_line(d, ST_GRAY, " timeline needs a measured wall for this record");
+        return;
+    }
+
+    ds4_tl_set_view(&t->tl, t->tl_v0_us, t->tl_v_us);
+    const uint32_t v0 = t->tl.v0_us;
+    const uint32_t v_us = t->tl.v_us ? t->tl.v_us : wall_us;
+    tl_axis_row(v0, v_us, cols, wide, axis);
+    doc_line(d, ST_GRAY, "%*s %s  ms", labelw, "", axis);
+
+    for (int i = 0; i < TUI_TL_LANES; i++) {
+        const int lane = k_tl_lanes[i].lane;
+        if (ds4_tl_count(&t->tl, lane) == 0) continue;
+        ds4_tl_paint(&t->tl, lane, cols, '.', ':', '#', ' ', bar);
+        const double ms = ds4_tl_lane_us(&t->tl, lane) / 1000.0;
+        /* Zoomed in, the bar is a slice but the number stays the lane's total
+         * for the token: say so, or the two read as the same measurement. */
+        doc_line(d, k_tl_lanes[i].style, " %-5s %s %5.1fms%s",
+                 k_tl_lanes[i].name, bar, ms,
+                 v_us < wall_us ? " all" : "");
+    }
+
+    /* Overlap first: it is the reason the lanes exist. Only pairs that share a
+     * column are worth a number, and the three largest keep the line short. */
+    const int pairs[][2] = {
+        { DS4_TL_XFER, DS4_TL_DEV0 }, { DS4_TL_XFER, DS4_TL_DEV1 },
+        { DS4_TL_XFER, DS4_TL_WAIT }, { DS4_TL_WAIT, DS4_TL_DEV0 },
+        { DS4_TL_WAIT, DS4_TL_DEV1 }, { DS4_TL_HOST, DS4_TL_DEV0 },
+        { DS4_TL_HOST, DS4_TL_DEV1 }, { DS4_TL_HOST, DS4_TL_XFER },
+        { DS4_TL_HOST, DS4_TL_WAIT }, { DS4_TL_DEV0, DS4_TL_DEV1 },
+        { -1, -1 },
+    };
+    double best[3] = { 0, 0, 0 };
+    int best_a[3] = { -1, -1, -1 }, best_b[3] = { -1, -1, -1 };
+    for (int i = 0; pairs[i][0] >= 0; i++) {
+        const int a = pairs[i][0], b = pairs[i][1];
+        if (ds4_tl_count(&t->tl, a) == 0 || ds4_tl_count(&t->tl, b) == 0) continue;
+        const double ms = ds4_tl_overlap_us(&t->tl, a, b) / 1000.0;
+        if (ms < 0.05) continue;
+        for (int k = 0; k < 3; k++) {
+            if (ms > best[k]) {
+                for (int j = 2; j > k; j--) {
+                    best[j] = best[j - 1];
+                    best_a[j] = best_a[j - 1];
+                    best_b[j] = best_b[j - 1];
+                }
+                best[k] = ms;
+                best_a[k] = a;
+                best_b[k] = b;
+                break;
+            }
+        }
+    }
+    {
+        tui_block *b = block_alloc(t, 1, 40, 0);
+        if (best_a[0] < 0) {
+            doc_line(&b->doc, ST_GRAY, " overlap: no two lanes share a column");
+        } else {
+            char line[200];
+            int w = 0;
+            for (int k = 0; k < 3 && best_a[k] >= 0; k++) {
+                const char *na = k_tl_lanes[0].name, *nb = k_tl_lanes[0].name;
+                for (int i = 0; i < TUI_TL_LANES; i++) {
+                    if (k_tl_lanes[i].lane == best_a[k]) na = k_tl_lanes[i].name;
+                    if (k_tl_lanes[i].lane == best_b[k]) nb = k_tl_lanes[i].name;
+                }
+                w += snprintf(line + w, sizeof(line) - (size_t)w, "%s%s/%s %.1f",
+                              k ? "  " : v_us < wall_us
+                                      ? " overlap (whole token): "
+                                      : " overlap: ", na, nb, best[k]);
+            }
+            doc_line(&b->doc, ST_GRAY, "%s ms", line);
+        }
+        const double covered = ds4_tl_union_us(&t->tl) / 1000.0;
+        const double wall_ms = (double)wall_us / 1000.0;
+        const double gap = wall_ms > covered ? wall_ms - covered : 0.0;
+        doc_line(&b->doc, ST_GRAY,
+                 " covered %.1f of %.1f ms (%.0f%%), %.1f ms not attributed to a"
+                 " stage", covered, wall_ms,
+                 wall_ms > 0 ? 100.0 * covered / wall_ms : 0.0, gap);
+        doc_blocks(t, d, 1, 40);
+    }
+    doc_line(d, ST_GRAY, " lanes: host=CPU launch, gpu*=device busy, xfer=bytes in"
+             " flight, wait=host blocked by a sync; each lane drops the time a"
+             " more specific lane already covers");
+    doc_line(d, ST_GRAY, " shading is duty in the column: . <25%%, : 25-75%%, # >75%%;"
+             " %.1f-%.1f ms of %.1f", (double)v0 / 1000.0,
+             (double)(v0 + v_us) / 1000.0, (double)wall_us / 1000.0);
+    if (t->tl_note[0]) doc_line(d, ST_GRAY, "%s", t->tl_note);
+    if (wide && t->detail_open_xfer)
+        doc_line(d, ST_YELLOW,
+                 " %d span(s) never closed inside this record: they belong to the"
+                 " window of the next one", t->detail_open_xfer);
+}
+
+/* The overlay shows the same lanes at the full terminal width: on a 200-column
+ * screen one millisecond is nearly two columns, which is where the overlap
+ * between a transfer and the compute that waits for it becomes readable. */
+static void timeline_overlay_build(ds4_tui *t) {
+    doc_clear(&t->tl_doc);
+    const int inner = t->scr.cols - 2;
+    const ds4_prof_record *r = &t->detail;
+    doc_line(&t->tl_doc, ST_TITLE,
+             " timeline of record #%llu - %s - %.1f ms of wall, %d events",
+             (unsigned long long)r->seq,
+             r->kind == DS4_PREC_DECODE_TOKEN ? "decode" :
+             r->kind == DS4_PREC_PREFILL_CHUNK ? "prefill chunk" : "prefill token",
+             r->ms, t->detail_event_n);
+    timeline_render(t, &t->tl_doc, inner, 1);
+    doc_line(&t->tl_doc, ST_GRAY,
+             " Esc/t closes, PgUp/PgDn scrolls, Ctrl-Y copies;"
+             " +/- zooms the window, Left/Right pans it, 0 fits the token again");
+}
+
 static void build_detail(ds4_tui *t) {
     tui_doc *d = &t->prof;
     doc_clear(d);
@@ -1894,6 +2261,16 @@ static void build_detail(ds4_tui *t) {
                  (unsigned long long)r.n_tokens);
         doc_blocks(t, d, 1, 52);
     }
+
+    /* The timeline sits under the counters: the numbers say how much, this
+     * says when, and which parts ran at the same time. `t` opens it whole. */
+    if (t->tl_built_seq != t->detail.seq || t->tl_built_n != t->detail_event_n) {
+        timeline_build(t);
+        t->tl_built_seq = t->detail.seq;
+        t->tl_built_n = t->detail_event_n;
+    }
+    doc_line(d, ST_TITLE, " Timeline%s", t->tl_open ? " (open: t)" : "  (t: full width)");
+    timeline_render(t, d, t->prof_cols, 0);
 
     /* The same table as the overview, filled from this record: one token's
      * stages against the same categories, with the share of this record. */
@@ -2216,6 +2593,19 @@ static void build_help(ds4_tui *t) {
                  "sampling, detokenising and the gaps between stages. Expert uses "
                  "show where a weight lived (source) and the device that ran it "
                  "(from -> to).");
+        para_put(d, ST_GRAY,
+                 "The timeline is the same record as a picture: one row per lane "
+                 "on the record's own axis, so two rows filled at the same column "
+                 "are work that ran at the same time. host is the CPU encoding a "
+                 "stage, gpu* is a device window the host waited for, xfer is "
+                 "bytes in flight, wait is the host blocked in a stream sync. "
+                 "Shading is the lane's duty in the column (a whole-token view of "
+                 "3000 two-microsecond launches would otherwise be a solid bar). "
+                 "Each lane drops the time a more specific lane already covers, so "
+                 "a read that blocked the CPU is counted once; transfers that run "
+                 "beside the compute stay in both, because that overlap is the "
+                 "point. t opens it full width, where +/- zoom to single stages "
+                 "and Left/Right pan.");
         break;
     case PV_DEVICES:
         para_put(d, ST_GRAY,
@@ -2261,6 +2651,8 @@ static void build_help(ds4_tui *t) {
     doc_line(d, ST_NORMAL, "1 .. 5            overview, tokens, detail, devices, experts");
     doc_line(d, ST_NORMAL, "Enter             open the selected token or chunk");
     doc_line(d, ST_NORMAL, "Esc               detail back to the list; leave help/console");
+    doc_line(d, ST_NORMAL, "t (detail)        floating timeline: full width, Esc closes");
+    doc_line(d, ST_NORMAL, "  + / - / arrows  zoom the timeline window, 0 fits it again");
     doc_line(d, ST_NORMAL, "f                 record filter: decode, prefill, all");
     doc_line(d, ST_NORMAL, "[ / ]             newer / older page of records");
     doc_line(d, ST_NORMAL, "u                 load records created while generating");
@@ -2430,6 +2822,25 @@ void ds4_tui_redraw(ds4_tui *t) {
     draw_doc(&t->scr, &t->help, prof_x + 2, msg_y + 1, prof_w - 4, msg_h - 2,
              &help_pv);
     t->slide = chat_slide || prof_slide || msg_slide || help_slide;
+
+    /* The timeline overlay covers the panes, never the input or hint rows: a
+     * floating pane the size of the terminal, closed with Esc or t. */
+    if (t->tl_open) {
+        timeline_overlay_build(t);
+        const int ow = cols, oh = rows - 2;
+        for (int y = 1; y < oh - 1; y++)
+            for (int x = 1; x < ow - 1; x++)
+                screen_put(&t->scr, y, x, ' ', ST_NORMAL, 1);
+        draw_box_top(&t->scr, 0, 0, ow, "timeline  (t/Esc closes)", 1);
+        draw_box_side(&t->scr, 0, 1, oh - 2);
+        draw_box_side(&t->scr, ow - 1, 1, oh - 2);
+        draw_box_bottom(&t->scr, 0, oh - 1, ow, 1);
+        int tl_top = t->tl_scroll;
+        pane_view tl_pv = { &tl_top, NULL, NULL, &t->hoff, &t->hoff_t, &t->slide,
+                            now, 0 };
+        draw_doc(&t->scr, &t->tl_doc, 1, 1, ow - 2, oh - 2, &tl_pv);
+        t->tl_scroll = tl_top;
+    }
 
     /* Input + status share one stable row; the hint row never changes. */
     const int input_y = rows - 2;
@@ -2973,6 +3384,57 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
         }
     }
 
+    /* The floating timeline owns the keyboard while it is up: scrolling the
+     * pane behind it would look like the overlay is moving. */
+    if (t->tl_open) {
+        const int page = t->scr.rows > 8 ? t->scr.rows - 6 : 4;
+        const int ch = (k == K_CHAR && ulen == 1) ? (unsigned char)utf8[0] : 0;
+        if (k == K_ESC || ch == 't' || ch == 'q') {
+            t->tl_open = 0;
+        } else if (k == K_PGUP) {
+            t->tl_scroll -= page;
+            if (t->tl_scroll < 0) t->tl_scroll = 0;
+        } else if (k == K_PGDN) {
+            t->tl_scroll += page;
+        } else if (k == K_UP) {
+            if (t->tl_scroll > 0) t->tl_scroll--;
+        } else if (k == K_DOWN) {
+            t->tl_scroll++;
+        } else if (k == K_HOME) {
+            t->tl_scroll = 0;
+        } else if (k == K_END) {
+            t->tl_scroll = 1 << 20;
+        } else if (k == K_LEFT || k == K_RIGHT || ch == '+' || ch == '=' ||
+                   ch == '-' || ch == '_' || ch == '0' || ch == 'g') {
+            const uint32_t wall = t->tl.wall_us ? t->tl.wall_us : 1u;
+            uint32_t v = t->tl_v_us ? t->tl_v_us : wall;
+            uint32_t v0 = t->tl_v0_us;
+            if (k == K_LEFT || k == K_RIGHT) {
+                const uint32_t step = v / 4 ? v / 4 : 1u;
+                if (k == K_LEFT) v0 = v0 > step ? v0 - step : 0;
+                else v0 = v0 + step;
+            } else if (ch == '0' || ch == 'g') {
+                v = wall;
+                v0 = 0;
+            } else if (ch == '+' || ch == '=') {
+                const uint32_t nv = v / 2 > 500u ? v / 2 : 500u;
+                v0 = v0 + (v - nv) / 2;
+                v = nv;
+            } else {
+                v = v > wall / 2 ? wall : v * 2;
+                v0 = v0 > (v - (v / 2)) / 2 ? v0 - (v - v / 2) / 4 : 0;
+            }
+            if (v > wall) v = wall;
+            if (v0 + v > wall) v0 = wall - v;
+            t->tl_v0_us = v0;
+            t->tl_v_us = v;
+        } else if (k == K_CTRL_Y) {
+            copy_emit(t, "token timeline", t->tl_doc.s, t->tl_doc.len, 1 << 20);
+        }
+        t->dirty = 1;
+        return;
+    }
+
     if (t->focus == DS4_TUI_PROFILER) {
         if (k == K_LEFT || k == K_ESC) {
             if (t->pv == PV_DETAIL) { t->pv = PV_TOKENS; t->dirty = 1; }
@@ -3045,6 +3507,14 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
                 t->h_n = 0;
                 t->h_head = 0;
                 ds4_tui_log(t, 0, "profiler aggregates reset");
+                t->dirty = 1;
+                return;
+            }
+            if (c == 't' && t->pv == PV_DETAIL) {
+                t->tl_open = 1;
+                t->tl_scroll = 0;
+                t->tl_v0_us = 0;
+                t->tl_v_us = 0;
                 t->dirty = 1;
                 return;
             }

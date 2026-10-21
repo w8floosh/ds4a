@@ -24,6 +24,9 @@ extern "C" {
 #endif
 
 #define DS4_PROFILER_MAX_DEV  16
+/* Device id for a span whose producer only knows the host side (a stage
+ * boundary, a sampling step): the timeline keeps it out of the GPU rows. */
+#define DS4_PROF_DEV_UNKNOWN  0xFFu
 #define DS4_PROFILER_TYPE_LEN 24
 
 /* Per-device snapshot. Byte fields are raw; the profiler pane turns them into
@@ -228,7 +231,6 @@ typedef enum {
     DS4_PSTEP_HOST_ROUTER,
     DS4_PSTEP_HOST_ATTN,
     DS4_PSTEP_HOST_SHARED,
-    DS4_PSTEP_HOST_MOE_PREP,
     DS4_PSTEP_HOST_TIER_DISPATCH,
     DS4_PSTEP_HOST_COMBINE,
     DS4_PSTEP_HOST_HEAD,
@@ -275,6 +277,8 @@ typedef struct {
  * lock, no allocation and no device queries. */
 void ds4_profiler_note_step(ds4_prof_step step, uint64_t ns,
                             uint64_t count, uint64_t bytes);
+void ds4_profiler_note_step_dev(ds4_prof_step step, uint8_t device, uint64_t ns,
+                                uint64_t count, uint64_t bytes);
 void ds4_profiler_step_snapshot(ds4_prof_step_stat *out, int n);
 const char *ds4_profiler_step_id(ds4_prof_step step);
 const char *ds4_profiler_step_label(ds4_prof_step step);
@@ -355,8 +359,9 @@ enum {
 typedef struct {
     uint64_t seq;       /* global monotonic event sequence */
     uint64_t rec_seq;   /* owning record sequence, 0 if none */
-    uint32_t t_us;      /* microseconds since the record started */
+    uint32_t t_us;      /* END of the span, in microseconds since record start */
     uint32_t dur_ns;    /* event duration; 0 when instantaneous */
+    uint32_t enc_ns;    /* stage events: the CPU launch part of dur_ns */
     uint16_t kind;      /* DS4_PEV_* */
     uint16_t stage;     /* interned stage id for DS4_PEV_STAGE */
     uint16_t layer;
@@ -578,6 +583,14 @@ void ds4_profiler_note_stage(const char *part, const char *name,
                              uint32_t layer, uint32_t pos, uint32_t n_tokens,
                              uint64_t total_ns, uint64_t encode_ns,
                              uint64_t wait_ns, uint64_t bytes);
+/* Same, naming the device the work ran on (0 primary, 1 cache tier). The
+ * timeline needs it to put a span in the right lane; DS4_PROF_DEV_UNKNOWN keeps
+ * a producer that cannot know out of the per-device rows. */
+void ds4_profiler_note_stage_dev(const char *part, const char *name,
+                                 uint8_t device, uint32_t layer, uint32_t pos,
+                                 uint32_t n_tokens, uint64_t total_ns,
+                                 uint64_t encode_ns, uint64_t wait_ns,
+                                 uint64_t bytes);
 
 /* Prefill is measured per sync call, not per token.  `chunks` is how many
  * prefill chunks the measurement covers: callers timing a single chunk pass 1,
