@@ -65,15 +65,18 @@ reads, so this fork adds:
   `--force-primary-gpu`, `--force-cache-gpu`, `--disable-multi-gpu`,
   `--kv-cache-location`, and `--chunk-size` override it. One device (or
   `--disable-multi-gpu`) degrades to the unchanged single-GPU path.
-* **Three-pane terminal UI and per-token profiler.** In the interactive REPL
+* **Four-pane terminal UI and per-token profiler.** In the interactive REPL
   (on by default on a TTY; `--no-tui` keeps the line editor), the screen is
-  split into chat, a live profiler, and a messages pane. `Tab`/`Shift-Tab`
-  switches the interacted pane; every pane scrolls independently with
-  `PgUp`/`PgDn`. Controls and engine stderr go to messages, never into the
-  assistant text. The profiler has five views: aggregate cost, a compact
-  token/prefill-chunk list, a full per-record detail page, live devices
-  (nvtop-style), and expert residency. Records and events are also served as
-  JSON to the optional browser dashboard (`--dashboard-lan`/`--dashboard-bind`).
+  split into chat and a live profiler on top, with a console and a help pane
+  below them. `Tab`/`Shift-Tab` cycles the panes and `Alt-1`..`Alt-4` jumps to
+  one directly; every pane scrolls independently with `PgUp`/`PgDn` and a row
+  cursor that never pins the viewport. Controls and engine stderr go to the
+  console, never into the assistant text. The profiler has five views:
+  aggregate cost, a compact token/prefill-chunk list, a full per-record detail
+  page, live devices (nvtop-style), and expert residency. The help pane follows
+  the visible profiler view with an explanation of its numbers and lists every
+  hotkey. Records and events are also served as JSON to the optional browser
+  dashboard (`--dashboard-lan`/`--dashboard-bind`).
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
 * **Host-side expert page-cache budget.** Hot experts stay in the OS page cache
@@ -272,17 +275,21 @@ The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
 `/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
 Run each binary with `--help` for its full options.
 
-On a terminal the REPL uses the three-pane UI (chat, profiler, messages).
-`Tab`/`Shift-Tab` switches panes; each pane scrolls with `PgUp`/`PgDn`. In the
-profiler, `1` overview, `2` tokens/chunks, `3` selected record detail, `4`
-devices, `5` experts; `Up`/`Down` selects, `Enter` opens, `Esc` returns,
-`PgUp`/`PgDn` pages the record list, `u` reloads it, `p` toggles stage capture
-and `r` resets aggregates. The list is frozen while decoding so it cannot slide
-under the reader; new records are counted and appear on `u` or when decoding
-stops. `Ctrl-B` enables breakpoint mode: the engine pauses after each token or
-prefill chunk so the profiler can be inspected; `Space` continues, `b` disables
-and continues, `Ctrl-C` cancels generation. `--no-tui` keeps the classic
-line editor. The profiler is also written as JSONL when
+On a terminal the REPL uses the four-pane UI: chat, profiler, console and help.
+`Tab`/`Shift-Tab` cycles them, `Alt-1`..`Alt-4` focuses one directly, and `?`
+opens the help pane from anywhere. Each pane scrolls with `Up`/`Down`,
+`PgUp`/`PgDn` and `Home`/`End`; scrolling is never constrained by the cursor.
+In the profiler, `1` overview, `2` tokens/chunks, `3` selected record detail,
+`4` devices, `5` experts; `Up`/`Down` selects, `Enter` opens, `Esc` returns,
+`PgUp`/`PgDn` pages the record list, `f` filters decode/prefill, `[`/`]` pages
+older records, `u` reloads it, `p` toggles stage capture and `r` resets
+aggregates. The help pane explains whichever profiler view is visible and lists
+the keys. The list is frozen while decoding so it cannot slide under the
+reader; new records are counted and appear on `u` or when decoding stops.
+`Ctrl-B` enables breakpoint mode: the engine pauses after each token or prefill
+chunk so the profiler can be inspected; `Space` continues, `b` disables and
+continues, `Ctrl-C` cancels generation. `--no-tui` keeps the classic line
+editor. The profiler is also written as JSONL when
 `DS4_PROFILE_TRACE=/path/to/trace.jsonl` is set.
 
 The UI repaints only the cells that changed, so it stays usable over slow links

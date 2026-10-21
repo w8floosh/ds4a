@@ -1,9 +1,9 @@
-/* ds4_tui.h — three-pane terminal UI for chat, live profiler and messages.
+/* ds4_tui.h — four-pane terminal UI: chat, live profiler, console and help.
  *
  * The UI is a renderer over ds4_profiler snapshots plus a chat transcript
  * buffer. It owns the terminal (raw mode, alternate screen) and captures
- * stderr into the bottom pane so engine warnings can never be mistaken for
- * model output.
+ * stderr into the console pane so engine warnings can never be mistaken for
+ * model output; the help pane next to it explains whatever the profiler shows.
  *
  * Generation stays synchronous: the frontend calls ds4_tui_pump() from token
  * and prefill callbacks. pump() reads keys non-blocking, drains stderr and
@@ -25,11 +25,12 @@ typedef enum {
     DS4_TUI_CHAT = 0,
     DS4_TUI_PROFILER,
     DS4_TUI_MESSAGES,
+    DS4_TUI_HELP,
     DS4_TUI_PANE_COUNT
 } ds4_tui_focus;
 
 /* Create the UI only when both stdin and stdout are terminals. Returns NULL
- * when it cannot or when DS4_TUI=0. stderr is redirected into the messages
+ * when it cannot or when DS4_TUI=0. stderr is redirected into the console
  * pane until destroy. */
 ds4_tui *ds4_tui_create(void);
 void     ds4_tui_destroy(ds4_tui *t);
@@ -42,7 +43,7 @@ void ds4_tui_chat_role(ds4_tui *t, int role, const char *label);
 void ds4_tui_chat_append(ds4_tui *t, const char *text, size_t len, int think);
 void ds4_tui_chat_newline(ds4_tui *t);
 
-/* Messages pane. */
+/* Console pane: engine stderr and UI notices. */
 void ds4_tui_log(ds4_tui *t, int level, const char *fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 3, 4)))

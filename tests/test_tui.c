@@ -1,4 +1,4 @@
-/* tests/test_tui.c — render the three-pane UI with the synthetic feed.
+/* tests/test_tui.c — render the four-pane UI with the synthetic feed.
  *
  * Needs a terminal; run it through script(1) or a pty harness:
  *   DS4_TUI_FAKE=1 script -qec ./tests/test_tui /dev/null

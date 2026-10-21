@@ -69,7 +69,8 @@ typedef enum {
     K_NONE = 0, K_CHAR, K_ENTER, K_BACKSPACE, K_DELETE, K_LEFT, K_RIGHT,
     K_UP, K_DOWN, K_PGUP, K_PGDN, K_HOME, K_END, K_TAB, K_STAB, K_ESC,
     K_CTRL_A, K_CTRL_B, K_CTRL_C, K_CTRL_D, K_CTRL_E, K_CTRL_K, K_CTRL_L,
-    K_CTRL_U, K_CTRL_W, K_CTRL_N, K_CTRL_P, K_ALT_1, K_ALT_2, K_ALT_3
+    K_CTRL_U, K_CTRL_W, K_CTRL_N, K_CTRL_P, K_ALT_1, K_ALT_2, K_ALT_3,
+    K_ALT_4
 } tui_key;
 
 typedef enum {
@@ -107,21 +108,22 @@ struct ds4_tui {
     int saved_stderr;
     int pipe_r, pipe_w;
 
-    tui_doc chat, msg, prof;
+    tui_doc chat, msg, help, prof;
     int prof_scroll;
-    int chat_top, msg_top;
+    int chat_top, msg_top, help_top;
     int chat_follow, msg_follow;
     /* Row cursor per pane (index into the wrapped visual lines, -1 = none).
      * A value wider than the pane is only readable if it can be scrolled, so
      * the cursor row alone is drawn with a horizontal offset that advances by
      * itself; every other row stays left aligned. */
-    int cur_chat, cur_msg, cur_prof;
+    int cur_chat, cur_msg, cur_prof, cur_help;
     int hoff;                 /* columns shifted inside the cursor row      */
     double hoff_t;            /* last advance of hoff                       */
     size_t sel_off;           /* byte offset of the selected record's row   */
     int sel_off_valid;
     int slide;                /* cursor row is wider than its pane          */
-    int chat_cols, msg_cols;  /* content widths of the panes, set per frame */
+    int reveal_cur;           /* a key moved the cursor: scroll it into view */
+    int chat_cols, msg_cols, help_cols;  /* pane content widths, per frame */
     /* Tokens view filter: decode only by default, because a decode token is
      * what a latency question is about and prefill chunks drown it. */
     int kind_filter;
@@ -159,7 +161,6 @@ struct ds4_tui {
     int granular;
     int breakpoints;
     int paused;
-    int help;
     int records_enabled;
     ds4_prof_record_meta list[DS4_PROF_REC_RING];
     int list_n;
@@ -320,9 +321,11 @@ static int cp_width(const char *s, size_t n, size_t *used) {
     return w < 1 ? 1 : w;
 }
 
-/* Split a doc into visual lines at width `w`. The result is cached on the doc:
- * text is append-only except after doc_clear(), and a resize is the only thing
- * that changes the width, so a streaming chat does not re-wrap per frame. */
+/* Split a doc into visual lines at width `w`, preferring a word boundary in the
+ * second half of the line so prose does not break mid-word. The result is
+ * cached on the doc: text is append-only except after doc_clear(), and a resize
+ * is the only thing that changes the width, so a streaming chat does not
+ * re-wrap per frame. */
 static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
     if (w < 1) w = 1;
     if (!d->wrap_stale && d->wrap && d->wrap_w == w && d->wrap_len == d->len) {
@@ -338,6 +341,8 @@ static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
     int n = 0;
     size_t i = 0, start = 0;
     int col = 0;
+    size_t brk = 0;       /* byte after the last space on this visual line */
+    int brk_col = 0;      /* its column, so a wrapped tail keeps its width  */
     while (i < d->len) {
         unsigned char c = (unsigned char)d->s[i];
         if (c != '\n' && start == i && d->st && (d->st[i] & ST_NOWRAP)) {
@@ -351,7 +356,7 @@ static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
             }
             v[n].off = start; v[n].len = i - start; n++;
             if (i < d->len) i++;
-            start = i; col = 0;
+            start = i; col = 0; brk = 0;
             continue;
         }
         if (c == '\n') {
@@ -362,7 +367,12 @@ static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
                 d->wrap = v;
             }
             v[n].off = start; v[n].len = i - start; n++;
-            i++; start = i; col = 0;
+            i++; start = i; col = 0; brk = 0;
+            continue;
+        }
+        if (c == ' ') {
+            brk = i + 1; brk_col = col + 1;
+            col++; i++;
             continue;
         }
         if (c == '\t') {
@@ -375,7 +385,7 @@ static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
                     d->wrap = v;
                 }
                 v[n].off = start; v[n].len = i - start; n++;
-                start = i; col = 0;
+                start = i; col = 0; brk = 0;
                 continue;
             }
             col += adv; i++;
@@ -384,14 +394,23 @@ static const vis_line *doc_wrap(tui_doc *d, int w, int *out_n) {
         size_t used = 1;
         int cw = cp_width(d->s + i, d->len - i, &used);
         if (col + cw > w && col > 0) {
+            size_t end = i;
+            int tail = 0;
+            /* Break at the last space when it is not so early that the line
+             * would look ragged; the tail keeps its counted width so a word
+             * longer than the pane still splits at the edge. */
+            if (brk > start && brk_col * 2 >= w) {
+                end = brk - 1;            /* the space is dropped */
+                tail = col - brk_col;
+            }
             if (n == d->wrap_cap) {
                 d->wrap_cap *= 2;
                 v = realloc(d->wrap, (size_t)d->wrap_cap * sizeof(*v));
                 if (!v) { *out_n = 0; return NULL; }
                 d->wrap = v;
             }
-            v[n].off = start; v[n].len = i - start; n++;
-            start = i; col = 0;
+            v[n].off = start; v[n].len = end - start; n++;
+            start = tail ? brk : i; col = tail; brk = 0;
             continue;
         }
         if (cw > w) cw = w;
@@ -713,9 +732,12 @@ static int vis_line_width(const tui_doc *d, const vis_line *l) {
 }
 
 /* One pane's scroll position plus its row cursor. The cursor line is moved by
- * the arrow keys, the view follows it, and when that single line is wider than
- * the pane it slides sideways by itself: that is what makes a clipped table
- * row readable without wrapping it (wrapping loses the column alignment). */
+ * the arrow keys and the view then follows it once; scrolling keys move the
+ * view alone and drag the cursor to the nearest visible row, so the two never
+ * fight (a cursor pinned to the pane edge used to block scrolling entirely).
+ * When the cursor row is wider than the pane it slides sideways by itself:
+ * that is what makes a clipped table row readable without wrapping it
+ * (wrapping loses the column alignment). */
 typedef struct {
     int *top;
     int *follow;
@@ -724,6 +746,7 @@ typedef struct {
     double *hoff_t;   /* when hoff last advanced, throttled by the caller  */
     int *slide;       /* set when the cursor row needs sliding             */
     double now;
+    int reveal;       /* this frame came from a cursor key                 */
 } pane_view;
 
 #define HOFF_STEP 0.07        /* seconds per column while sliding         */
@@ -738,24 +761,32 @@ static void draw_doc(screen *s, tui_doc *d, int x, int y, int w, int h,
     if (first < 0) first = 0;
     if (first > max_first) first = max_first;
 
-    /* The cursor owns the vertical position: keep it inside the window. */
+    /* A cursor key scrolls the view to the cursor; any other scroll (PgUp,
+     * PgDn, wheel) owns the viewport and the cursor rides along on the nearest
+     * visible row. Without that split a cursor resting on the top or bottom
+     * row kept snapping the pane back and scrolling stalled at the edges. */
     int cur = pv->cur ? *pv->cur : -1;
     if (n > 0 && cur >= n) cur = n - 1;
     if (cur < 0) cur = -1;
-    if (cur >= 0) {
+    if (cur >= 0 && pv->reveal) {
         if (cur < first) first = cur;
         if (cur >= first + h) first = cur - h + 1;
         if (first > max_first) first = max_first;
-        if (pv->follow) *pv->follow = (first == max_first);
+        if (first < 0) first = 0;
+    } else if (cur >= 0) {
+        if (cur < first) cur = first;
+        else if (cur >= first + h) cur = first + h - 1;
+        if (cur > n - 1) cur = n - 1;
     }
     if (pv->cur) *pv->cur = cur;
-    if (pv->follow && first >= max_first) *pv->follow = 1;
+    if (pv->follow) *pv->follow = (first >= max_first);
     *pv->top = first;
 
     /* Slide only the cursor row, and only when it does not fit. */
+    const int cur_seen = cur >= first && cur < first + h;
     int hoff = 0;
     int hmax = 0;
-    if (cur >= 0 && cur < n && pv->hoff) {
+    if (cur_seen && cur < n && pv->hoff) {
         const int width = vis_line_width(d, &lines[cur]);
         hmax = width > w ? width - w : 0;
         hoff = *pv->hoff;
@@ -773,7 +804,7 @@ static void draw_doc(screen *s, tui_doc *d, int x, int y, int w, int h,
     for (int row = 0; row < h; row++) {
         const int li = first + row;
         if (li < 0 || li >= n) break;
-        const int is_cur = (li == cur);
+        const int is_cur = cur_seen && (li == cur);
         const int skip = is_cur ? hoff : 0;
         size_t i = lines[li].off, end = lines[li].off + lines[li].len;
         int col = 0, drawn = 0;
@@ -1085,10 +1116,8 @@ static void build_overview(ds4_tui *t) {
     doc_line(d, ST_TITLE, " D %.2f t/s  %.2f ms  P %.2f t/s",
              ds4_prof_avg(&tm->tokens_per_s), ds4_prof_avg(&tm->per_token_ms),
              ds4_prof_avg(&tm->prefill_tokens_per_s));
-    doc_line(d, ST_GRAY, " capture %s (p)  n=%llu", t->granular ? "on" : "off",
+    doc_line(d, ST_GRAY, " capture %s  n=%llu", t->granular ? "on" : "off",
              (unsigned long long)tm->tokens);
-    if (t->granular)
-        doc_line(d, ST_GRAY, "  serialised capture: tok/s low");
     const ds4_prof_record_meta *ld = latest_kind(t, DS4_PREC_DECODE_TOKEN);
     const ds4_prof_record_meta *lp = latest_kind(t, DS4_PREC_PREFILL_CHUNK);
     if (!lp) lp = latest_kind(t, DS4_PREC_PREFILL_TOKEN);
@@ -1162,7 +1191,6 @@ static void build_overview(ds4_tui *t) {
     doc_line(d, ST_NORMAL, "");
 
     doc_line(d, ST_TITLE, " Cost per token by stage");
-    doc_line(d, ST_GRAY, "  total = CPU launch + device wait; shared per its own kind");
     const int wide = t->prof_cols >= 86;
     const char *cats[] = {"attention", "routed", "shared", "router", "indexer",
                           "norm and mixing", "output", "other"};
@@ -1218,13 +1246,12 @@ static void build_overview(ds4_tui *t) {
                  units > 0 ? ksum / units : 0, "", 100.0);
         if (!shown)
             doc_line(d, ST_YELLOW,
-                     "  no stage rows captured; stage capture is %s (p toggles)",
+                     "  no stage rows captured (capture is %s)",
                      t->granular ? "on" : "off");
     }
     doc_line(d, ST_NORMAL, "");
 
     doc_line(d, ST_TITLE, " Transfers and waits (overlap stages)");
-    doc_line(d, ST_GRAY, "  measured blocking time, not a second total");
     int sub = 0;
     for (int i = 0; i < v->n_stages; i++) {
         const ds4_prof_stage_view *s = &v->stages[i];
@@ -1371,16 +1398,11 @@ static void build_tokens(ds4_tui *t) {
     else
         doc_line(d, ST_TITLE, " Records [%s]  page %d/%d", kind_filter_name(t),
                  t->page + 1, pages);
-    if (!tiny) {
-        doc_line(d, ST_GRAY, " f filter (decode/prefill/all)  Arrows select  Enter detail");
-        doc_line(d, ST_GRAY, " PgUp/PgDn page  u reload");
-    }
     if (t->list_n <= 0) {
         if (t->kind_filter != 2)
-            doc_line(d, ST_YELLOW, "  no %s records yet; f switches the filter",
-                     kind_filter_name(t));
+            doc_line(d, ST_YELLOW, "  no %s records yet", kind_filter_name(t));
         else
-            doc_line(d, ST_YELLOW, "  no records yet; generation creates one per token/chunk");
+            doc_line(d, ST_YELLOW, "  no records yet");
         return;
     }
     const int wide = t->prof_cols >= 84;
@@ -1408,17 +1430,9 @@ static void build_tokens(ds4_tui *t) {
             if (begin < 0) begin = 0;
         }
     }
-    /* What the hot stage actually is: it is the biggest measured stage of the
-     * selected record, not a separate measurement of its own. */
-    if (t->prof_cols >= 40) {
-        const ds4_prof_record_meta *m = sel_meta(t);
-        if (m && m->hot_stage < (uint16_t)v->n_stages) {
-            const ds4_prof_stage_view *hs = &v->stages[m->hot_stage];
-            doc_line(d, ST_GRAY, " hot stage %s = %s", hs->label, hs->hint);
-        } else {
-            doc_line(d, ST_GRAY, " hot stage = the biggest measured stage of the selected record");
-        }
-    }
+    /* Resolve the selection once before rows are marked, so the highlighted
+     * row is the record the help card and the detail page describe. */
+    (void)sel_meta(t);
     t->sel_off_valid = 0;
     for (int i = end; i >= begin; i--) {
         const ds4_prof_record_meta *r = &t->list[i];
@@ -1452,14 +1466,14 @@ static void build_detail(ds4_tui *t) {
     tui_doc *d = &t->prof;
     doc_clear(d);
     if (!t->detail_ready) {
-        doc_line(d, ST_YELLOW, " no record open; press Esc and choose one from the list");
+        doc_line(d, ST_YELLOW, " no record open (Enter on a record in view 2)");
         return;
     }
     ds4_prof_record r = t->detail;
     doc_line(d, ST_TITLE, " %s #%llu pos %d tok %u %.2f/%.2fms",
              ds4_profiler_record_kind_name(r.kind), (unsigned long long)r.seq,
              r.pos, r.n_tokens, r.ms, r.n_tokens ? r.ms / r.n_tokens : r.ms);
-    doc_line(d, ST_GRAY, " text: %s  Esc back  g/G ends", r.text[0] ? r.text : "(none)");
+    doc_line(d, ST_GRAY, " text: %s", r.text[0] ? r.text : "(none)");
     {
         char bssd[24], bram[24];
         ds4_profiler_format_bytes(bssd, sizeof(bssd), r.ssd_read_bytes);
@@ -1501,7 +1515,7 @@ static void build_detail(ds4_tui *t) {
                           (unsigned long long)u->count, by);
     }
     if (r.stage_n == 0)
-        doc_line(d, ST_YELLOW, "  no stages recorded; enable stage capture with p and decode again");
+        doc_line(d, ST_YELLOW, "  no stages recorded (stage capture was off)");
     {
         uint64_t sum = 0;
         for (uint32_t i = 0; i < r.stage_n; i++) sum += r.stages[i].total_ns;
@@ -1509,21 +1523,11 @@ static void build_detail(ds4_tui *t) {
         const double named = (double)sum / 1e6;
         if (wall >= named)
             doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; named stages %.3f ms; residual %.3f ms (sampling, detok, gaps)",
+                     "  wall %.3f ms; named stages %.3f ms; residual %.3f ms",
                      wall, named, wall - named);
         else
             doc_line(d, ST_GRAY,
-                     "  wall %.3f ms; named stages %.3f ms (serialised capture can exceed wall)",
-                     wall, named);
-    }
-    if (r.stage_n > 0) {
-        doc_line(d, ST_TITLE, " What each recorded operation means");
-        for (uint32_t i = 0; i < r.stage_n; i++) {
-            const int id = r.stages[i].id;
-            if (!t->view || id >= t->view->n_stages) continue;
-            doc_line(d, ST_GRAY, "  %-26.26s %s",
-                     t->view->stages[id].label, t->view->stages[id].hint);
-        }
+                     "  wall %.3f ms; named stages %.3f ms", wall, named);
     }
 
     doc_line(d, ST_TITLE, " Devices at record start / end (all devices on the machine)");
@@ -1595,7 +1599,7 @@ static void build_devices(ds4_tui *t) {
     tui_doc *d = &t->prof;
     doc_clear(d);
     ds4_prof_view *v = t->view;
-    doc_line(d, ST_TITLE, " Devices (nvtop style)  1 overview  2 tokens  5 experts");
+    doc_line(d, ST_TITLE, " Devices (nvtop style)");
     const double ssd_peak = 2e9;
     double series[64];
     const int n = t->h_n < 60 ? t->h_n : 60;
@@ -1725,6 +1729,117 @@ static void build_profiler(ds4_tui *t) {
     }
 }
 
+/* The help card next to the console. Everything that used to be a hint or an
+ * explanation inside the profiler pane lives here instead: the pane needs its
+ * columns for numbers, and this card can follow whichever view is on screen.
+ * It is rebuilt per frame, which is cheap because it is a few dozen lines. */
+static void build_help(ds4_tui *t) {
+    tui_doc *d = &t->help;
+    doc_clear(d);
+    doc_line(d, ST_TITLE, " profiler: %s", view_name(t->pv));
+    switch (t->pv) {
+    case PV_TOKENS:
+        doc_line(d, ST_GRAY,
+                 " One record per decoded token (D) or prefill chunk (P), newest");
+        doc_line(d, ST_GRAY,
+                 " first. The list is frozen while generating so it cannot slide");
+        doc_line(d, ST_GRAY,
+                 " under the reader; u loads what arrived since. Hot stage is the");
+        doc_line(d, ST_GRAY,
+                 " largest measured stage of the selected record, not a");
+        doc_line(d, ST_GRAY, " measurement of its own.");
+        if (t->view) {
+            const ds4_prof_record_meta *m = sel_meta(t);
+            if (m && m->hot_stage < (uint16_t)t->view->n_stages)
+                doc_line(d, ST_NORMAL, " %s = %s",
+                         t->view->stages[m->hot_stage].label,
+                         t->view->stages[m->hot_stage].hint);
+        }
+        break;
+    case PV_DETAIL:
+        doc_line(d, ST_GRAY,
+                 " total = CPU launch time + device wait, so a stage never hides");
+        doc_line(d, ST_GRAY,
+                 " what its own launch cost. Stage times are per-device wall");
+        doc_line(d, ST_GRAY,
+                 " clock: one record runs on two GPUs at once, so their sum can");
+        doc_line(d, ST_GRAY,
+                 " exceed the record wall. The residual is sampling, detokenising");
+        doc_line(d, ST_GRAY,
+                 " and the gaps between stages. Expert uses show where a weight");
+        doc_line(d, ST_GRAY, " lived (source) and the device that ran it (from -> to).");
+        break;
+    case PV_DEVICES:
+        doc_line(d, ST_GRAY,
+                 " Bars are the current value, the spark line the last 60 samples");
+        doc_line(d, ST_GRAY,
+                 " and the whole row the last 24. VRAM and RAM are used of total");
+        doc_line(d, ST_GRAY,
+                 " on that device and on the host; the SSD spark is scaled to");
+        doc_line(d, ST_GRAY, " 2 GB/s so a slow disk still shows its shape.");
+        break;
+    case PV_EXPERTS:
+        doc_line(d, ST_GRAY,
+                 " Every expert lives in exactly one tier: VRAM on a GPU, the");
+        doc_line(d, ST_GRAY,
+                 " pinned host arena in RAM, or the SSD. Routing lists, for the");
+        doc_line(d, ST_GRAY,
+                 " selected token, where each expert was read from and where it");
+        doc_line(d, ST_GRAY,
+                 " ran. Arena hits were served from RAM, admissions are misses");
+        doc_line(d, ST_GRAY,
+                 " that took an empty slot, evictions reclaim a slot when full.");
+        break;
+    default:
+        doc_line(d, ST_GRAY,
+                 " D/P are averages since the last reset (r); ms/token is the whole");
+        doc_line(d, ST_GRAY,
+                 " decode record, so that is the latency that matters. Stage rows");
+        doc_line(d, ST_GRAY,
+                 " are per-device wall clock of one kind only: the two GPUs overlap");
+        doc_line(d, ST_GRAY,
+                 " inside one token, so their sum can pass the wall and each share");
+        doc_line(d, ST_GRAY,
+                 " is of that kind's own total. Capture (p) serialises the GPU, so");
+        doc_line(d, ST_GRAY, " tok/s reads low while it is on.");
+        break;
+    }
+    doc_line(d, ST_NORMAL, "");
+    doc_line(d, ST_TITLE, " keys");
+    doc_line(d, ST_GRAY, " profiler keys need the profiler pane focused (Alt-2).");
+    doc_line(d, ST_NORMAL, " Tab / Shift-Tab   cycle the four panes");
+    doc_line(d, ST_NORMAL, " Alt-1 .. Alt-4    chat, profiler, console, help");
+    doc_line(d, ST_NORMAL, " Up / Down         move the row cursor");
+    doc_line(d, ST_NORMAL, " PgUp / PgDn       scroll the pane; the cursor never blocks it");
+    doc_line(d, ST_NORMAL, " Home / End        cursor to the first / last row");
+    doc_line(d, ST_NORMAL, " 1 .. 5            overview, tokens, detail, devices, experts");
+    doc_line(d, ST_NORMAL, " Enter             open the selected token or chunk");
+    doc_line(d, ST_NORMAL, " Esc               detail back to the list; leave help/console");
+    doc_line(d, ST_NORMAL, " f                 record filter: decode, prefill, all");
+    doc_line(d, ST_NORMAL, " [ / ]             newer / older page of records");
+    doc_line(d, ST_NORMAL, " u                 load records created while generating");
+    doc_line(d, ST_NORMAL, " g / G             jump to the start / end");
+    doc_line(d, ST_NORMAL, " p                 stage capture on / off");
+    doc_line(d, ST_NORMAL, " r                 reset the profiler aggregates");
+    doc_line(d, ST_NORMAL, " Ctrl-B            breakpoints: pause after each token/chunk");
+    doc_line(d, ST_NORMAL, " Space / c / b     continue; b also drops breakpoints");
+    doc_line(d, ST_NORMAL, " ?                 this card, from any pane");
+    doc_line(d, ST_NORMAL, " chat: Enter sends, Ctrl-P/N move in the transcript,");
+    doc_line(d, ST_NORMAL, " Ctrl-U pages it, Ctrl-C clears the line, Ctrl-D exits.");
+    doc_line(d, ST_GRAY, " A row wider than its pane slides sideways while it is the");
+    doc_line(d, ST_GRAY, " selected row, and returns to column 0 when it is not.");
+    if (t->pv == PV_DETAIL && t->view && t->detail_ready && t->detail.stage_n) {
+        doc_line(d, ST_NORMAL, "");
+        doc_line(d, ST_TITLE, " what each recorded operation means");
+        for (uint32_t i = 0; i < t->detail.stage_n; i++) {
+            const int id = t->detail.stages[i].id;
+            if (id >= t->view->n_stages) continue;
+            doc_line(d, ST_GRAY, "  %s: %s", t->view->stages[id].label,
+                     t->view->stages[id].hint);
+        }
+    }
+}
+
 static void prof_refresh(ds4_tui *t, int force) {
     const double now = tui_now();
     if (!force && now - t->last_refresh < 0.50) return;
@@ -1769,8 +1884,14 @@ void ds4_tui_redraw(ds4_tui *t) {
         t->last_draw = tui_now();
         return;
     }
-    int top_h = (rows - 2) * 3 / 5;
-    if (top_h < 6) top_h = 6;
+    /* Top: chat over the left half, profiler over the right half. Bottom: the
+     * console and the help card, aligned under those same two halves and each
+     * in its own box. The bottom strip is about a third shorter than the old
+     * single messages pane, so the panes that carry the numbers get the rows;
+     * the help text wraps and scrolls, it does not need them all. */
+    int top_h = (rows - 2) * 11 / 15;
+    if (top_h < 8) top_h = 8;
+    if (top_h > rows - 6) top_h = rows - 6;
     int msg_h = rows - 2 - top_h;
     if (msg_h < 4) msg_h = 4;
     const int chat_w = cols / 2;
@@ -1782,6 +1903,7 @@ void ds4_tui_redraw(ds4_tui *t) {
 
     prof_refresh(t, 0);
     build_profiler(t);
+    build_help(t);
 
     draw_box_top(&t->scr, 0, 0, chat_w, "chat  [1]", t->focus == DS4_TUI_CHAT);
     char ptitle[80];
@@ -1797,39 +1919,61 @@ void ds4_tui_redraw(ds4_tui *t) {
     draw_box_bottom(&t->scr, 0, top_h - 1, chat_w, t->focus == DS4_TUI_CHAT);
     draw_box_bottom(&t->scr, prof_x, top_h - 1, prof_w, t->focus == DS4_TUI_PROFILER);
 
-    /* Only the focused pane shows a cursor; the other two keep their scroll
+    /* Only the focused pane shows a cursor; the others keep their scroll
      * position and stay plain so the eye knows where the keys act. */
     const double now = tui_now();
+    const int reveal_cur = t->reveal_cur;
+    t->reveal_cur = 0;
     int prof_cur = -1;
     if (t->pv == PV_TOKENS && t->sel_off_valid)
         prof_cur = doc_visual_line(&t->prof, prof_w - 2, t->sel_off);
     else if (t->pv != PV_TOKENS)
         prof_cur = t->cur_prof;
     t->chat_cols = chat_w - 2;
-    t->msg_cols = cols - 2;
+    t->msg_cols = chat_w - 2;
+    t->help_cols = prof_w - 2;
     t->slide = 0;
-    int chat_slide = 0, prof_slide = 0, msg_slide = 0;
+    int chat_slide = 0, prof_slide = 0, msg_slide = 0, help_slide = 0;
     pane_view chat_pv = { &t->chat_top, &t->chat_follow,
                           t->focus == DS4_TUI_CHAT ? &t->cur_chat : NULL,
-                          &t->hoff, &t->hoff_t, &chat_slide, now };
+                          &t->hoff, &t->hoff_t, &chat_slide, now,
+                          t->focus == DS4_TUI_CHAT && reveal_cur };
+    /* In the token list the selection is the cursor and is always brought into
+     * view; that view pages instead of scrolling freely, so it asks for the
+     * reveal every frame and never drags the selection along with a scroll. */
     pane_view prof_pv = { &t->prof_scroll, NULL,
                           t->focus == DS4_TUI_PROFILER ? &prof_cur : NULL,
-                          &t->hoff, &t->hoff_t, &prof_slide, now };
+                          &t->hoff, &t->hoff_t, &prof_slide, now,
+                          t->focus == DS4_TUI_PROFILER &&
+                              (t->pv == PV_TOKENS || reveal_cur) };
     draw_doc(&t->scr, &t->chat, 1, 1, chat_w - 2, top_h - 2, &chat_pv);
     draw_doc(&t->scr, &t->prof, prof_x + 1, 1, prof_w - 2, top_h - 2, &prof_pv);
     if (t->focus == DS4_TUI_PROFILER && prof_cur >= 0) t->cur_prof = prof_cur;
 
-    draw_box_top(&t->scr, 0, msg_y, cols, "messages  [3]",
+    draw_box_top(&t->scr, 0, msg_y, chat_w, "console  [3]",
                  t->focus == DS4_TUI_MESSAGES);
+    draw_box_top(&t->scr, prof_x, msg_y, prof_w, "help  [4]",
+                 t->focus == DS4_TUI_HELP);
     draw_box_side(&t->scr, 0, msg_y + 1, msg_h - 2);
+    draw_box_side(&t->scr, chat_w - 1, msg_y + 1, msg_h - 2);
+    draw_box_side(&t->scr, prof_x, msg_y + 1, msg_h - 2);
     draw_box_side(&t->scr, cols - 1, msg_y + 1, msg_h - 2);
-    draw_box_bottom(&t->scr, 0, msg_y + msg_h - 1, cols,
+    draw_box_bottom(&t->scr, 0, msg_y + msg_h - 1, chat_w,
                     t->focus == DS4_TUI_MESSAGES);
+    draw_box_bottom(&t->scr, prof_x, msg_y + msg_h - 1, prof_w,
+                    t->focus == DS4_TUI_HELP);
     pane_view msg_pv = { &t->msg_top, &t->msg_follow,
                          t->focus == DS4_TUI_MESSAGES ? &t->cur_msg : NULL,
-                         &t->hoff, &t->hoff_t, &msg_slide, now };
-    draw_doc(&t->scr, &t->msg, 1, msg_y + 1, cols - 2, msg_h - 2, &msg_pv);
-    t->slide = chat_slide || prof_slide || msg_slide;
+                         &t->hoff, &t->hoff_t, &msg_slide, now,
+                         t->focus == DS4_TUI_MESSAGES && reveal_cur };
+    pane_view help_pv = { &t->help_top, NULL,
+                          t->focus == DS4_TUI_HELP ? &t->cur_help : NULL,
+                          &t->hoff, &t->hoff_t, &help_slide, now,
+                          t->focus == DS4_TUI_HELP && reveal_cur };
+    draw_doc(&t->scr, &t->msg, 1, msg_y + 1, chat_w - 2, msg_h - 2, &msg_pv);
+    draw_doc(&t->scr, &t->help, prof_x + 1, msg_y + 1, prof_w - 2, msg_h - 2,
+             &help_pv);
+    t->slide = chat_slide || prof_slide || msg_slide || help_slide;
 
     /* Input + status share one stable row; the hint row never changes. */
     const int input_y = rows - 2;
@@ -1851,7 +1995,7 @@ void ds4_tui_redraw(ds4_tui *t) {
                     t->status[0] ? t->status : "working", strlen(t->status[0] ? t->status : "working"));
     } else {
         screen_puts(&t->scr, input_y, 0, ST_GRAY,
-                    "(chat pane not focused - Tab returns)", 37);
+                    "(chat pane not focused - Alt-1 or Tab returns)", 45);
     }
     if (t->status[0] && !t->busy && t->focus == DS4_TUI_CHAT) {
         int sl = (int)strlen(t->status);
@@ -1860,7 +2004,7 @@ void ds4_tui_redraw(ds4_tui *t) {
     }
 
     screen_printf(&t->scr, rows - 1, 0, ST_GRAY,
-                  " Tab pane | PgUp/PgDn scroll | 1-5 views | Ctrl-B breakpoints %s | p capture | r reset",
+                  " Tab/Shift-Tab pane | PgUp/PgDn scroll | 1-5 views | Ctrl-B BP %s | p capture | ? help",
                   t->breakpoints ? "ON" : "off");
 
     screen_flush(&t->scr, input_y + 1,
@@ -2015,6 +2159,7 @@ static tui_key read_key(ds4_tui *t, char *utf8, size_t *ulen) {
         if (c2 == '1') return K_ALT_1;
         if (c2 == '2') return K_ALT_2;
         if (c2 == '3') return K_ALT_3;
+        if (c2 == '4') return K_ALT_4;
         return K_ESC;
     }
     utf8[0] = (char)c;
@@ -2042,6 +2187,9 @@ static void scroll_focus(ds4_tui *t, int delta) {
         t->msg_follow = 0;
         t->msg_top += delta;
         if (t->msg_top < 0) t->msg_top = 0;
+    } else if (t->focus == DS4_TUI_HELP) {
+        t->help_top += delta;
+        if (t->help_top < 0) t->help_top = 0;
     } else {
         t->prof_scroll += delta;
         if (t->prof_scroll < 0) t->prof_scroll = 0;
@@ -2085,6 +2233,7 @@ static tui_doc *cur_doc(ds4_tui *t) {
     switch (t->focus) {
     case DS4_TUI_PROFILER: return &t->prof;
     case DS4_TUI_MESSAGES: return &t->msg;
+    case DS4_TUI_HELP: return &t->help;
     default: return &t->chat;
     }
 }
@@ -2093,6 +2242,7 @@ static int *cur_line(ds4_tui *t) {
     switch (t->focus) {
     case DS4_TUI_PROFILER: return &t->cur_prof;
     case DS4_TUI_MESSAGES: return &t->cur_msg;
+    case DS4_TUI_HELP: return &t->cur_help;
     default: return &t->cur_chat;
     }
 }
@@ -2101,6 +2251,7 @@ static int cur_cols(const ds4_tui *t) {
     switch (t->focus) {
     case DS4_TUI_PROFILER: return t->prof_cols;
     case DS4_TUI_MESSAGES: return t->msg_cols;
+    case DS4_TUI_HELP: return t->help_cols;
     default: return t->chat_cols;
     }
 }
@@ -2124,6 +2275,7 @@ static void cursor_move(ds4_tui *t, int delta) {
     else *c += delta;
     if (*c < 0) *c = 0;
     if (*c > n - 1) *c = n - 1;
+    t->reveal_cur = 1;
     t->hoff = 0;
     t->hoff_t = 0;
     t->dirty = 1;
@@ -2138,6 +2290,7 @@ static void cursor_edge(ds4_tui *t, int last) {
     int n = 0;
     (void)doc_wrap(d, w, &n);
     *c = n > 0 ? (last ? n - 1 : 0) : -1;
+    t->reveal_cur = 1;
     t->hoff = 0;
     t->hoff_t = 0;
     t->dirty = 1;
@@ -2158,6 +2311,7 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
     if (k == K_ALT_1) { t->focus = DS4_TUI_CHAT; t->dirty = 1; return; }
     if (k == K_ALT_2) { t->focus = DS4_TUI_PROFILER; t->dirty = 1; return; }
     if (k == K_ALT_3) { t->focus = DS4_TUI_MESSAGES; t->dirty = 1; return; }
+    if (k == K_ALT_4) { t->focus = DS4_TUI_HELP; t->dirty = 1; return; }
     if (k == K_CTRL_L) { t->dirty = 1; return; }
     if (k == K_CTRL_B) {
         t->breakpoints = !t->breakpoints;
@@ -2200,6 +2354,8 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
                 t->cur_prof = -1;
                 t->hoff = 0;
                 t->hoff_t = 0;
+                t->cur_help = -1;   /* the card now explains another view */
+                t->help_top = 0;
                 if (t->pv == PV_TOKENS) {
                     t->list_frozen = 1;
                     list_refresh(t, 1);
@@ -2223,6 +2379,8 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
                 t->page = 0;
                 t->prof_scroll = 0;
                 t->cur_prof = -1;
+                t->cur_help = -1;
+                t->help_top = 0;
                 ds4_tui_log(t, 0, "records filter: %s only (%d shown)",
                             kind_filter_name(t), t->list_n);
                 t->dirty = 1;
@@ -2253,8 +2411,9 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
             }
             if (c == 'g') { t->prof_scroll = 0; t->dirty = 1; return; }
             if (c == 'G') { t->prof_scroll = 1 << 20; t->dirty = 1; return; }
-            if (c == '?') {
-                ds4_tui_log(t, 0, "keys: Tab/shift-Tab panes; profiler 1-5 views; Up/Down select; Enter detail; Esc list; PgUp/PgDn page; u refresh list; p capture; r reset");
+            if (c == '?') {     /* the help card holds the key map */
+                t->focus = DS4_TUI_HELP;
+                t->dirty = 1;
                 return;
             }
         }
@@ -2300,6 +2459,21 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
         else if (k == K_PGDN) scroll_focus(t, 10);
         else if (k == K_HOME) cursor_edge(t, 0);
         else if (k == K_END) cursor_edge(t, 1);
+        else if (k == K_LEFT || k == K_ESC) { t->focus = DS4_TUI_CHAT; t->dirty = 1; }
+        else if (k == K_CHAR && ulen == 1 && utf8[0] == '?') {
+            t->focus = DS4_TUI_HELP;
+            t->dirty = 1;
+        }
+        return;
+    }
+    if (t->focus == DS4_TUI_HELP) {
+        if (k == K_UP) cursor_move(t, -1);
+        else if (k == K_DOWN) cursor_move(t, 1);
+        else if (k == K_PGUP) scroll_focus(t, -10);
+        else if (k == K_PGDN) scroll_focus(t, 10);
+        else if (k == K_HOME) cursor_edge(t, 0);
+        else if (k == K_END) cursor_edge(t, 1);
+        else if (k == K_LEFT || k == K_ESC) { t->focus = DS4_TUI_CHAT; t->dirty = 1; }
         return;
     }
 
@@ -2474,7 +2648,7 @@ ds4_tui *ds4_tui_create(void) {
     ds4_profiler_set_stage_capture(1);
     t->records_enabled = 1;
     term_size(t);
-    ds4_tui_log(t, 3, "ds4 terminal UI: chat, live profiler and messages. Tab switches panes; ? shows keys.");
+    ds4_tui_log(t, 3, "ds4 terminal UI: chat, live profiler, console and help. Tab cycles panes, Alt-1..4 jumps, ? opens help.");
     if (getenv("DS4_TUI_FAKE")) tui_fake_feed(t);
     ds4_tui_redraw(t);
     return t;
@@ -2487,6 +2661,7 @@ void ds4_tui_destroy(ds4_tui *t) {
     t->active = 0;
     free(t->chat.s); free(t->chat.st); free(t->chat.wrap);
     free(t->msg.s); free(t->msg.st); free(t->msg.wrap);
+    free(t->help.s); free(t->help.st); free(t->help.wrap);
     free(t->prof.s); free(t->prof.st); free(t->prof.wrap);
     free(t->detail_events);
     free(t->detail_experts);
