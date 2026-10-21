@@ -1831,6 +1831,7 @@ static void build_help(ds4_tui *t) {
     doc_line(d, ST_NORMAL, " Space / c / b     continue; b also drops breakpoints");
     doc_line(d, ST_NORMAL, " ?                 this card, from any pane");
     doc_line(d, ST_NORMAL, " Ctrl-Y            copy the focused pane to the clipboard");
+    doc_line(d, ST_NORMAL, " Y (profiler)      copy the whole view, all pages, one text");
     doc_line(d, ST_NORMAL, " chat: Enter sends, Ctrl-P/N move in the transcript,");
     doc_line(d, ST_NORMAL, " Ctrl-U pages it, Ctrl-C clears the line, Ctrl-D exits.");
     doc_line(d, ST_GRAY, " Chat takes bracketed pastes: multi-line text arrives as");
@@ -2408,14 +2409,38 @@ static void b64_add(sbuf *b, const char *s, size_t n) {
     }
 }
 
+/* OSC 52 rides on one escape sequence, so a copy stays bounded. The caller
+ * picks the cap: a pane is a screenful, a whole view can be thousands of rows. */
+static void copy_emit(ds4_tui *t, const char *name, const char *data, size_t len,
+                      size_t cap) {
+    if (len == 0) {
+        ds4_tui_log(t, 1, "nothing to copy in the %s", name);
+        return;
+    }
+    size_t n = len;
+    const int cut = n > cap;
+    if (cut) n = cap;
+    sbuf b64;
+    memset(&b64, 0, sizeof(b64));
+    b64_add(&b64, data, n);
+    fputs("\x1b]52;c;", stdout);
+    fwrite(b64.s, 1, b64.len, stdout);
+    fputc('\a', stdout);
+    fflush(stdout);
+    ds4_tui_log(t, 0, "copied %s to the clipboard (%zu bytes%s)", name, n,
+                cut ? ", truncated" : "");
+    ds4_tui_status(t, "copied %s to the clipboard", name);
+    free(b64.s);
+}
+
 /* Ctrl-Y hands the focused pane to the terminal clipboard over OSC 52. Mouse
  * selection only ever sees the cells currently on screen and loses them as the
  * panes repaint, and the alternate screen never reaches the scrollback, so
  * this is the way to take text out of the UI (tmux needs set-clipboard on). */
 static void copy_focused(ds4_tui *t) {
-    const char *name = t->focus == DS4_TUI_CHAT ? "chat" :
-                       t->focus == DS4_TUI_PROFILER ? "profiler" :
-                       t->focus == DS4_TUI_MESSAGES ? "console" : "help";
+    const char *name = t->focus == DS4_TUI_CHAT ? "chat pane" :
+                       t->focus == DS4_TUI_PROFILER ? "profiler pane" :
+                       t->focus == DS4_TUI_MESSAGES ? "console pane" : "help pane";
     sbuf text;
     memset(&text, 0, sizeof(text));
     if (t->focus == DS4_TUI_PROFILER) {
@@ -2436,26 +2461,31 @@ static void copy_focused(ds4_tui *t) {
         size_t take = d->len < 131072 ? d->len : 131072;   /* OSC 52 is small */
         if (take) sb_add(&text, d->s, take);
     }
-    if (text.len == 0) {
-        ds4_tui_log(t, 1, "nothing to copy in the %s pane", name);
-        free(text.s);
-        return;
-    }
-    size_t n = text.len;
-    int cut = 0;
-    if (n > 131072) { n = 131072; cut = 1; }   /* OSC 52 payloads have limits */
-    sbuf b64;
-    memset(&b64, 0, sizeof(b64));
-    b64_add(&b64, text.s, n);
-    fputs("\x1b]52;c;", stdout);
-    fwrite(b64.s, 1, b64.len, stdout);
-    fputc('\a', stdout);
-    fflush(stdout);
-    ds4_tui_log(t, 0, "copied %s pane to the clipboard (%zu bytes%s)", name, n,
-                cut ? ", truncated" : "");
-    ds4_tui_status(t, "copied %s to the clipboard", name);
-    free(b64.s);
+    copy_emit(t, name, text.s, text.len, 131072);
     free(text.s);
+}
+
+/* 'Y' takes the whole view rather than the window: the tokens view is paged and
+ * every view is clipped to the pane height, so a visible copy loses records.
+ * Render the view once into a scratch doc with a viewport tall enough to hold
+ * all of it, then hand the live doc back untouched. */
+static void copy_prof_all(ds4_tui *t) {
+    tui_doc live = t->prof;
+    const int live_rows = t->prof_rows;
+    const int live_page = t->page;
+    memset(&t->prof, 0, sizeof(t->prof));
+    t->prof_rows = t->list_n + 16;   /* now one page holds every record */
+    t->page = 0;
+    build_profiler(t);
+    tui_doc full = t->prof;
+    t->prof = live;
+    t->prof_rows = live_rows;
+    t->page = live_page;
+    t->sel_off_valid = 0;    /* the offset pointed into the scratch doc */
+    copy_emit(t, "whole profiler view", full.s, full.len, 1 << 20);
+    free(full.s);
+    free(full.st);
+    free(full.wrap);
 }
 
 static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
@@ -2574,6 +2604,7 @@ static void handle_key(ds4_tui *t, tui_key k, const char *utf8, size_t ulen) {
             }
             if (c == 'g') { t->prof_scroll = 0; t->dirty = 1; return; }
             if (c == 'G') { t->prof_scroll = 1 << 20; t->dirty = 1; return; }
+            if (c == 'Y') { copy_prof_all(t); return; }
             if (c == '?') {     /* the help card holds the key map */
                 t->focus = DS4_TUI_HELP;
                 t->dirty = 1;

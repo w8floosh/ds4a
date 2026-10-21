@@ -76,8 +76,10 @@ reads, so this fork adds:
   page, live devices (nvtop-style), and expert residency. The help pane follows
   the visible profiler view with an explanation of its numbers and lists every
   hotkey. `Ctrl-Y` copies the focused pane to the terminal clipboard over OSC 52
-  (`set-clipboard on` in tmux), and the chat line accepts bracketed pastes as one
-  paste instead of a burst of keys. Records and events are also served as JSON to the optional browser
+  (`set-clipboard on` in tmux); `Y` in the profiler copies the whole visible view
+  instead of the window, so every record page and the full detail of the open
+  token come along. The chat line accepts bracketed pastes as one paste instead
+  of a burst of keys. Records and events are also served as JSON to the optional browser
   dashboard (`--dashboard-lan`/`--dashboard-bind`).
 * **Parallel `pread` pool (8 workers)** into pinned staging buffers, replacing
   the single-threaded chunk loop and saturating host read bandwidth.
